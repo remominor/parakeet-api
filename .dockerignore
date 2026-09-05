@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.pyc
+models/*.gguf
+sample.wav
+tests
+benchmark.py
+benchmark.sh
+benchmark_pt.py
+transcribe.py
+nano_parakeet

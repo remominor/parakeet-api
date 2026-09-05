@@ -1,0 +1,26 @@
+services:
+  parakeet-api:
+    build: .
+    image: nano-parakeet-api:latest
+    restart: unless-stopped
+    gpus: all
+    environment:
+      PARAKEET_MODEL_FILE: ${PARAKEET_MODEL_FILE:-tdt-0.6b-v2-f16.gguf}
+      PARAKEET_API_KEYS: ${PARAKEET_API_KEYS:-}
+      PARAKEET_MAX_UPLOAD_MB: ${PARAKEET_MAX_UPLOAD_MB:-64}
+      PARAKEET_UPSTREAM_TIMEOUT: ${PARAKEET_UPSTREAM_TIMEOUT:-300}
+      PARAKEET_LOG_TRANSCRIPTS: ${PARAKEET_LOG_TRANSCRIPTS:-false}
+      PARAKEET_CORS_ORIGINS: ${PARAKEET_CORS_ORIGINS:-}
+      PARAKEET_WS_VAD_THRESHOLD: ${PARAKEET_WS_VAD_THRESHOLD:-0.5}
+      PARAKEET_WS_MIN_SILENCE_MS: ${PARAKEET_WS_MIN_SILENCE_MS:-350}
+      PARAKEET_WS_SPEECH_PAD_MS: ${PARAKEET_WS_SPEECH_PAD_MS:-120}
+      PARAKEET_WS_MAX_UTTERANCE_MS: ${PARAKEET_WS_MAX_UTTERANCE_MS:-8000}
+      PARAKEET_WS_MAX_FRAME_BYTES: ${PARAKEET_WS_MAX_FRAME_BYTES:-65536}
+    volumes: [./models:/models:ro]
+    ports: ["${PARAKEET_BIND_ADDRESS:-0.0.0.0}:${PARAKEET_PORT:-5092}:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz')\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
