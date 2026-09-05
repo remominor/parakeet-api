@@ -1,5 +1,6 @@
 services:
   parakeet-api:
+    container_name: parakeet-api
     build: .
     image: nano-parakeet-api:latest
     restart: unless-stopped
