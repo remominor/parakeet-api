@@ -85,7 +85,7 @@ async def warm(app: FastAPI):
         except httpx.HTTPError: pass
         await asyncio.sleep(2)
     LOG.error("model did not become ready")
-async def engine_transcribe(client: httpx.AsyncClient, payload: bytes, form: dict[str, Any]) -> tuple[dict[str, Any], float]:
+async def engine_transcribe(client: httpx.AsyncClient, payload: bytes, form: dict[str, Any], *, parse_json: bool = True) -> tuple[dict[str, Any] | str, float]:
     try:
         async with INFERENCE:
             started=time.perf_counter()
@@ -95,7 +95,13 @@ async def engine_transcribe(client: httpx.AsyncClient, payload: bytes, form: dic
         raise HTTPException(502,f"speech engine unavailable: {exc.__class__.__name__}") from exc
     if response.status_code!=200:
         raise HTTPException(response.status_code,response.text[:400] or "speech engine failed")
-    return response.json(), engine_ms
+    if not parse_json:
+        return response.text, engine_ms
+    try:
+        return response.json(), engine_ms
+    except ValueError as exc:
+        LOG.error("speech engine returned a non-JSON response for response_format=%r", form.get("response_format"))
+        raise HTTPException(502,"speech engine returned an invalid JSON response") from exc
 app=FastAPI(title="Parakeet OpenAI API",version="1.0.0",lifespan=lifespan)
 if SETTINGS.cors: app.add_middleware(CORSMiddleware,allow_origins=SETTINGS.cors,allow_credentials=False,allow_methods=["GET","POST","OPTIONS"],allow_headers=["Authorization","Content-Type","X-API-Key"])
 @app.exception_handler(HTTPException)
@@ -176,10 +182,11 @@ async def transcribe(request:Request,file:UploadFile=File(...),model:str|None=Fo
     if granularity: form["timestamp_granularities[]"]=granularity
     for key,value in (("language",language),("prompt",prompt),("temperature",temperature)):
         if value is not None: form[key]=str(value)
-    try: result,engine_ms=await engine_transcribe(request.app.state.client,payload,form)
+    try: result,engine_ms=await engine_transcribe(request.app.state.client,payload,form,parse_json=output!="text")
     except HTTPException: STATS.requests_failed+=1; raise
     total_ms=(time.perf_counter()-started)*1000; STATS.observe(total_ms); headers={"X-Parakeet-Model":MODEL_ID,"X-Parakeet-Engine-Ms":f"{engine_ms:.1f}","X-Parakeet-Total-Ms":f"{total_ms:.1f}","X-Parakeet-Transcoded":"1" if converted else "0"}
-    if output=="text": return PlainTextResponse(result.get("text", ""),headers=headers)
+    if output=="text": return PlainTextResponse(result,headers=headers)
+    assert isinstance(result, dict)
     STATS.audio_seconds_total+=float(result.get("duration") or 0); LOG.info("total=%.1fms engine=%.1fms %s",total_ms,engine_ms,repr(result.get("text","")) if SETTINGS.log_text else f"chars={len(result.get('text',''))}")
     if output in {"srt","vtt"}: return PlainTextResponse(subtitle(result,output),media_type="application/x-subrip" if output=="srt" else "text/vtt",headers=headers)
     return JSONResponse(result,headers=headers)
