@@ -2,7 +2,7 @@ services:
   parakeet-api:
     container_name: parakeet-api
     build: .
-    image: nano-parakeet-api:latest
+    image: parakeet-api:latest
     restart: unless-stopped
     gpus: all
     environment:
