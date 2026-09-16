@@ -4,5 +4,6 @@ __pycache__/
 .venv/
 models/*.gguf
 models/
+gateway/silero_vad.onnx
 .env
 /parakeet-api.xml

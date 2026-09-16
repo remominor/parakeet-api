@@ -62,8 +62,15 @@ curl http://127.0.0.1:5092/v1/audio/transcriptions \
 - `POST /v1/audio/transcriptions`: WAV, MP3, OGG, WebM, FLAC, and M4A uploads;
   `json`, `text`, `verbose_json`, `srt`, and `vtt` response formats.
 - `GET /v1/models`: returns `parakeet-tdt-0.6b-v2`.
-- `GET /health`, `GET /readyz`, and authenticated `GET /stats` support operation
-  and latency inspection.
+- `GET /health`, `GET /readyz`, authenticated `GET /stats`, and authenticated
+  `GET /info` support operation and capability discovery. Each transcription
+  response includes `X-Request-ID` (or preserves a valid supplied value).
+- Uploads are capped while streaming. An `audio_url` form field supports
+  `http`/`https` inputs, with redirects and private/local addresses rejected
+  by default; use `PARAKEET_URL_ALLOWED_HOSTS` for trusted internal hosts.
+- `verbose_json`, SRT, and VTT use timestamp-aware segments derived from native
+  word metadata. WebSocket final events include aggregate confidence; append
+  `?verbose=true` to include the native word list.
 
 ### Voice-turn WebSocket
 
@@ -74,7 +81,7 @@ uses CPU Silero VAD to identify voice turns and sends JSON lifecycle events:
 ```json
 {"type":"ready","sample_rate":16000,"model":"parakeet-tdt-0.6b-v2"}
 {"type":"speech_started","turn_id":"1"}
-{"type":"final","turn_id":"1","text":"...","duration_ms":1234.0,"engine_ms":25.1,"total_ms":25.3}
+{"type":"final","turn_id":"1","text":"...","duration_ms":1234.0,"engine_ms":25.1,"total_ms":25.3,"confidence":{"mean":0.95,"min":0.82,"low_word_count":0}}
 ```
 
 The endpoint emits final transcription only after 350 ms of detected silence
@@ -98,6 +105,10 @@ any network reachable beyond a trusted host.
 For the WAV voice-agent hot path, inspect `X-Parakeet-Engine-Ms` and
 `X-Parakeet-Total-Ms` response headers. Non-WAV uploads are decoded before
 inference and include `X-Parakeet-Transcoded: 1`.
+
+Set `PARAKEET_METRICS_ENABLED=true` to expose a dependency-free Prometheus
+text endpoint at `/metrics`. Set `PARAKEET_WEBUI_ENABLED=true` to expose the
+small local drag-and-drop UI at `/`; it has no server-side state.
 
 Run the basic check after readiness:
 
