@@ -80,7 +80,8 @@ uses CPU Silero VAD to identify voice turns and sends JSON lifecycle events:
 
 ```json
 {"type":"ready","sample_rate":16000,"model":"parakeet-tdt-0.6b-v2"}
-{"type":"speech_started","turn_id":"1"}
+{"type":"speech_started","turn_id":"1","audio_start_ms":120.0}
+{"type":"speech_stopped","turn_id":"1","audio_end_ms":1234.0}
 {"type":"final","turn_id":"1","text":"...","duration_ms":1234.0,"engine_ms":25.1,"total_ms":25.3,"confidence":{"mean":0.95,"min":0.82,"low_word_count":0}}
 ```
 
@@ -92,6 +93,22 @@ not token-by-token partial ASR.
 When API keys are enabled, authenticate with `Authorization: Bearer TOKEN` or
 `?api_key=TOKEN` (use the latter only for browser clients that cannot attach
 headers during the WebSocket handshake).
+
+The native socket also accepts JSON control events without closing the socket:
+`{"type":"commit"}` finalizes the active turn immediately,
+`{"type":"clear"}` discards it, and `{"type":"config","vad":{...}}`
+overrides VAD settings for that connection. Completed turns are queued (depth
+2) while the single GPU inference worker remains serialized; excess completed
+turns receive an explicit `turn_queue_full` error rather than growing memory.
+
+### OpenAI-style realtime transcription
+
+`ws://HOST/v1/realtime?model=parakeet&intent=transcription` is a thin
+transcription-only protocol adapter. It accepts `session.update`,
+`input_audio_buffer.append` (base64 PCM16 at 24 kHz), `commit`, and `clear`.
+It emits VAD lifecycle, committed-item, and completed-transcription events.
+Parakeet produces completed turns only: it does not emit synthetic partial
+transcript deltas.
 
 Tune endpointing through `PARAKEET_WS_VAD_THRESHOLD`,
 `PARAKEET_WS_MIN_SILENCE_MS`, `PARAKEET_WS_SPEECH_PAD_MS`, and

@@ -1,6 +1,6 @@
 """Low-latency OpenAI transcription gateway for the embedded Parakeet engine."""
 from __future__ import annotations
-import asyncio, hmac, io, ipaddress, logging, os, re, socket, struct, time, uuid
+import asyncio, base64, binascii, hmac, io, ipaddress, json, logging, os, re, socket, struct, time, uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -11,10 +11,10 @@ import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
-from .vad import StreamingVad
+from .vad import SAMPLE_RATE, StreamingVad, VadEvent
 
 logging.basicConfig(level=os.getenv("PARAKEET_LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
-LOG=logging.getLogger("parakeet-api"); TARGET_RATE=16000; MODEL_ID="parakeet-tdt-0.6b-v2"; VERSION="1.1.0"; FORMATS={"json","text","verbose_json","srt","vtt"}; RID_RE=re.compile(r"^[A-Za-z0-9._-]{1,128}$"); SENTENCE_RE=re.compile(r"[.?!][\"')\]]*$")
+LOG=logging.getLogger("parakeet-api"); TARGET_RATE=16000; MODEL_ID="parakeet-tdt-0.6b-v2"; VERSION="1.2.0"; FORMATS={"json","text","verbose_json","srt","vtt"}; RID_RE=re.compile(r"^[A-Za-z0-9._-]{1,128}$"); SENTENCE_RE=re.compile(r"[.?!][\"')\]]*$")
 def env_list(name:str)->list[str]: return [x.strip() for x in os.getenv(name,"").split(",") if x.strip()]
 def enabled(name:str, default="false")->bool: return os.getenv(name,default).lower() in {"1","true","yes","on"}
 @dataclass(frozen=True)
@@ -166,7 +166,7 @@ async def stats(authorization:str|None=Header(None),x_api_key:str|None=Header(No
  auth(authorization,x_api_key);return {"requests_total":STATS.requests_total,"requests_failed":STATS.requests_failed,"requests_active":STATS.requests_active,"requests_queued":STATS.requests_queued,"passthrough_total":STATS.passthrough_total,"transcoded_total":STATS.transcoded_total,"audio_seconds_total":round(STATS.audio_seconds_total,2),"websocket_connections_total":STATS.websocket_connections_total,"websocket_connections_active":STATS.websocket_connections_active,"websocket_turns_total":STATS.websocket_turns_total,"http_latency_ms":percentiles(STATS.request_ms),"websocket_latency_ms":percentiles(STATS.ws_ms),"engine_ms":percentiles(STATS.engine_ms),"decode_ms":percentiles(STATS.decode_ms)}
 @app.get("/info")
 async def info(request:Request,authorization:str|None=Header(None),x_api_key:str|None=Header(None,alias="X-API-Key")):
- auth(authorization,x_api_key);return {"service":"parakeet-api","version":VERSION,"model":MODEL_ID,"engine":"parakeet.cpp","language":["en"],"uptime_seconds":round(time.monotonic()-request.app.state.started,1),"capabilities":{"word_timestamps":True,"word_confidence":True,"segments":True,"srt":True,"vtt":True,"websocket_turn_endpointing":True,"partial_transcription":False,"translation":False,"prompt":False,"temperature_sampling":False},"limits":{"max_upload_mb":SETTINGS.limit//1048576,"websocket_max_frame_bytes":SETTINGS.ws_max_frame_bytes,"websocket_max_utterance_ms":SETTINGS.ws_max_utterance_ms}}
+ auth(authorization,x_api_key);return {"service":"parakeet-api","version":VERSION,"model":MODEL_ID,"engine":"parakeet.cpp","language":["en"],"uptime_seconds":round(time.monotonic()-request.app.state.started,1),"capabilities":{"word_timestamps":True,"word_confidence":True,"segments":True,"srt":True,"vtt":True,"websocket_turn_endpointing":True,"realtime_transcription":True,"partial_transcription":False,"translation":False,"prompt":False,"temperature_sampling":False},"limits":{"max_upload_mb":SETTINGS.limit//1048576,"websocket_max_frame_bytes":SETTINGS.ws_max_frame_bytes,"websocket_max_utterance_ms":SETTINGS.ws_max_utterance_ms,"websocket_completed_turn_queue":2}}
 @app.get("/metrics")
 async def metrics():
  if not SETTINGS.metrics_enabled:raise HTTPException(404,"metrics endpoint is disabled")
@@ -176,34 +176,137 @@ async def metrics():
  return Response("\n".join(lines)+"\n",media_type="text/plain; version=0.0.4")
 @app.post("/v1/audio/translations")
 async def translations():raise HTTPException(501,"translation is not supported; use /v1/audio/transcriptions")
+def vad_values(value:dict[str,Any])->dict[str,Any]:
+ allowed={"threshold","min_silence_ms","speech_pad_ms","max_utterance_ms"}
+ if not isinstance(value,dict) or set(value)-allowed:raise ValueError("unsupported VAD configuration field")
+ out={}
+ for key,item in value.items():
+  if key=="threshold" and isinstance(item,(int,float)) and .05<=float(item)<=.95:out[key]=float(item)
+  elif key=="min_silence_ms" and isinstance(item,int) and 50<=item<=5000:out[key]=item
+  elif key=="speech_pad_ms" and isinstance(item,int) and 0<=item<=2000:out[key]=item
+  elif key=="max_utterance_ms" and isinstance(item,int) and 250<=item<=60000:out[key]=item
+  else:raise ValueError(f"invalid VAD {key}")
+ return out
+def realtime_error(code:str,message:str)->dict[str,Any]:return {"type":"error","error":{"type":"invalid_request_error","code":code,"message":message}}
+def pcm24_to_16(data:bytes)->bytes:
+ """Linear 24 kHz PCM16 -> 16 kHz PCM16; realtime adapter only."""
+ if len(data)%2:raise ValueError("audio must be PCM16")
+ import numpy as np
+ source=np.frombuffer(data,dtype="<i2")
+ if not len(source):return b""
+ target=np.interp(np.arange((len(source)*2)//3)*1.5,np.arange(len(source)),source).round().astype("<i2")
+ return target.tobytes()
+@dataclass
+class CompletedTurn:
+ turn_id:str; audio:bytes; start_ms:float; end_ms:float; item_id:str|None=None
+async def run_turn_worker(app:FastAPI,queue:asyncio.Queue[CompletedTurn],emit,session_id:str):
+ while True:
+  turn=await queue.get();STATS.requests_total+=1;STATS.requests_active+=1;STATS.websocket_turns_total+=1;started=time.perf_counter()
+  try:result,engine_ms=await engine_transcribe(app.state.client,wav_bytes(turn.audio),{"response_format":"verbose_json","timestamp_granularities[]":["word"]})
+  except HTTPException as exc:STATS.requests_failed+=1;await emit(realtime_error("transcription_failed",str(exc.detail))|{"turn_id":turn.turn_id});queue.task_done();continue
+  finally:STATS.requests_active-=1
+  assert isinstance(result,dict);total_ms=(time.perf_counter()-started)*1000;STATS.ws_ms.append(total_ms);STATS.engine_ms.append(engine_ms);STATS.engine_ms_sum+=engine_ms;STATS.total_ms_sum+=total_ms;STATS.audio_seconds_total+=len(turn.audio)/32000
+  await emit((turn,result,engine_ms,total_ms));LOG.info("request_id=%s turn_id=%s total=%.1fms engine=%.1fms chars=%s",session_id,turn.turn_id,total_ms,engine_ms,len(result.get("text","")));queue.task_done()
+async def run_vad_events(detector:StreamingVad,events:list[VadEvent],turn_state:dict[str,Any],queue:asyncio.Queue[CompletedTurn],emit,lifecycle):
+ for event in events:
+  if event.kind=="speech_started":
+   turn_state["id"]=str(int(turn_state.get("next",0))+1);turn_state["next"]=int(turn_state["id"]);await lifecycle("speech_started",turn_state["id"],event)
+  elif event.kind=="speech_stopped" and turn_state.get("id"):await lifecycle("speech_stopped",turn_state["id"],event)
+  elif event.kind=="turn" and event.audio and turn_state.get("id"):
+   turn=CompletedTurn(turn_state["id"],event.audio,event.audio_start_ms or 0,event.audio_end_ms or 0,"item_"+uuid.uuid4().hex);event.item_id=turn.item_id;turn_state["id"]=None
+   if queue.full():await emit(realtime_error("turn_queue_full","completed-turn queue is full; turn was discarded")|{"turn_id":turn.turn_id})
+   else:await queue.put(turn);await lifecycle("committed",turn.turn_id,event)
 @app.websocket("/v1/audio/transcriptions/ws")
 async def stream_transcriptions(websocket:WebSocket):
  if not credentials_valid(websocket.headers.get("authorization"),websocket.query_params.get("api_key")):await websocket.close(code=1008,reason="invalid API key");return
- await websocket.accept();STATS.websocket_connections_total+=1;STATS.websocket_connections_active+=1;verbose=enabled_value(websocket.query_params.get("verbose"));session_id=request_id(websocket.headers.get("x-request-id"))
+ await websocket.accept();STATS.websocket_connections_total+=1;STATS.websocket_connections_active+=1;verbose=enabled_value(websocket.query_params.get("verbose"));session_id=request_id(websocket.headers.get("x-request-id"));send_lock=asyncio.Lock()
+ async def emit(value):
+  async with send_lock:
+   if isinstance(value,tuple):
+    turn,result,engine_ms,total_ms=value;out={"type":"final","turn_id":turn.turn_id,"text":result.get("text",""),"duration_ms":round(len(turn.audio)/32,1),"engine_ms":round(engine_ms,1),"total_ms":round(total_ms,1)}
+    if val:=confidence(result):out["confidence"]=val
+    if verbose:out["words"]=result.get("words",[])
+    await websocket.send_json(out)
+   else:await websocket.send_json(value)
+ async def lifecycle(kind,turn_id,event):
+  if kind=="speech_started":await emit({"type":"speech_started","turn_id":turn_id,"audio_start_ms":round(event.audio_start_ms or 0,1)})
+  elif kind=="speech_stopped":await emit({"type":"speech_stopped","turn_id":turn_id,"audio_end_ms":round(event.audio_end_ms or 0,1)})
  try:
-  detector=await asyncio.to_thread(StreamingVad,Path(__file__).with_name("silero_vad.onnx"),SETTINGS.ws_vad_threshold,SETTINGS.ws_min_silence_ms,SETTINGS.ws_speech_pad_ms,SETTINGS.ws_max_utterance_ms);await websocket.send_json({"type":"ready","sample_rate":TARGET_RATE,"model":MODEL_ID,"request_id":session_id});turn_id=0
+  detector=await asyncio.to_thread(StreamingVad,Path(__file__).with_name("silero_vad.onnx"),SETTINGS.ws_vad_threshold,SETTINGS.ws_min_silence_ms,SETTINGS.ws_speech_pad_ms,SETTINGS.ws_max_utterance_ms);queue=asyncio.Queue(maxsize=2);state={"next":0,"id":None};worker=asyncio.create_task(run_turn_worker(websocket.app,queue,emit,session_id));await emit({"type":"ready","sample_rate":TARGET_RATE,"model":MODEL_ID,"request_id":session_id})
   while True:
    message=await websocket.receive()
    if message["type"]=="websocket.disconnect":return
+   if message.get("text") is not None:
+    try:control=json.loads(message["text"])
+    except ValueError:await emit(realtime_error("invalid_control","control message must be JSON"));continue
+    if control.get("type")=="commit":
+     event=await asyncio.to_thread(detector.flush)
+     if event:await run_vad_events(detector,[VadEvent("speech_stopped",audio_end_ms=event.audio_end_ms),event],state,queue,emit,lifecycle)
+    elif control.get("type")=="clear":await asyncio.to_thread(detector.clear);state["id"]=None
+    elif control.get("type")=="config":
+     try:values=vad_values(control.get("vad"));await asyncio.to_thread(detector.configure,**values);await emit({"type":"config","vad":values})
+     except ValueError as exc:await emit(realtime_error("invalid_vad_config",str(exc)))
+    else:await emit(realtime_error("unsupported_control","unsupported native WebSocket control event"))
+    continue
    data=message.get("bytes")
-   if not data or message.get("text") is not None or len(data)%2 or len(data)>SETTINGS.ws_max_frame_bytes:await websocket.send_json({"type":"error","code":"invalid_audio_frame","message":"send non-empty PCM16 mono binary frames no larger than the configured limit"});await websocket.close(code=1003);return
-   for event in await asyncio.to_thread(detector.feed,data):
-    if event.kind=="speech_started":await websocket.send_json({"type":"speech_started","turn_id":str(turn_id+1)});continue
-    if event.audio is None:continue
-    turn_id+=1;STATS.requests_total+=1;STATS.requests_active+=1;STATS.websocket_turns_total+=1;started=time.perf_counter()
-    try:result,engine_ms=await engine_transcribe(websocket.app.state.client,wav_bytes(event.audio),{"response_format":"verbose_json","timestamp_granularities[]":["word"]})
-    except HTTPException as exc:STATS.requests_failed+=1;await websocket.send_json({"type":"error","code":"transcription_failed","message":str(exc.detail),"turn_id":str(turn_id)});continue
-    finally:STATS.requests_active-=1
-    assert isinstance(result,dict);total_ms=(time.perf_counter()-started)*1000;STATS.ws_ms.append(total_ms);STATS.engine_ms.append(engine_ms);STATS.engine_ms_sum+=engine_ms;STATS.total_ms_sum+=total_ms;STATS.audio_seconds_total+=len(event.audio)/32000;out={"type":"final","turn_id":str(turn_id),"text":result.get("text",""),"duration_ms":round(len(event.audio)/32,1),"engine_ms":round(engine_ms,1),"total_ms":round(total_ms,1)}
-    if value:=confidence(result):out["confidence"]=value
-    if verbose:out["words"]=result.get("words",[])
-    LOG.info("request_id=%s turn_id=%s total=%.1fms engine=%.1fms chars=%s",session_id,turn_id,total_ms,engine_ms,len(out["text"]));await websocket.send_json(out)
+   if not data or len(data)%2 or len(data)>SETTINGS.ws_max_frame_bytes:await emit(realtime_error("invalid_audio_frame","send non-empty PCM16 mono binary frames no larger than the configured limit"));await websocket.close(code=1003);return
+   await run_vad_events(detector,await asyncio.to_thread(detector.feed,data),state,queue,emit,lifecycle)
  except WebSocketDisconnect:return
- except Exception as exc:
-  LOG.exception("WebSocket VAD failure")
-  try:await websocket.send_json({"type":"error","code":"vad_unavailable","message":str(exc)})
-  except Exception:pass
- finally:STATS.websocket_connections_active-=1
+ except Exception as exc:LOG.exception("WebSocket VAD failure");await emit(realtime_error("vad_unavailable",str(exc)))
+ finally:
+  if 'worker' in locals():worker.cancel()
+  STATS.websocket_connections_active-=1
+@app.websocket("/v1/realtime")
+async def realtime_transcriptions(websocket:WebSocket):
+ if not credentials_valid(websocket.headers.get("authorization"),websocket.query_params.get("api_key")):await websocket.close(code=1008,reason="invalid API key");return
+ if websocket.query_params.get("intent","transcription")!="transcription" or (websocket.query_params.get("model") and websocket.query_params.get("model") not in SETTINGS.aliases):await websocket.close(code=1008,reason="transcription-only realtime endpoint");return
+ await websocket.accept();STATS.websocket_connections_total+=1;STATS.websocket_connections_active+=1;session_id="sess_"+uuid.uuid4().hex;send_lock=asyncio.Lock()
+ session={"id":session_id,"object":"realtime.transcription_session","model":MODEL_ID,"input_audio_format":"pcm16","input_audio_sample_rate_hz":24000,"turn_detection":{"threshold":SETTINGS.ws_vad_threshold,"silence_duration_ms":SETTINGS.ws_min_silence_ms,"prefix_padding_ms":SETTINGS.ws_speech_pad_ms}}
+ async def emit(value):
+  async with send_lock:
+   if isinstance(value,tuple):
+    turn,result,_,_=value;item_id=turn.item_id or "item_"+uuid.uuid4().hex
+    await websocket.send_json({"type":"conversation.item.created","event_id":"event_"+uuid.uuid4().hex,"item":{"id":item_id,"type":"message","role":"user","status":"completed"}})
+    await websocket.send_json({"type":"conversation.item.input_audio_transcription.completed","event_id":"event_"+uuid.uuid4().hex,"item_id":item_id,"content_index":0,"transcript":result.get("text",""),"usage":{"type":"duration","seconds":round(len(turn.audio)/32000,3)}})
+   else:await websocket.send_json(value)
+ async def lifecycle(kind,turn_id,event):
+  if kind=="speech_started":await emit({"type":"input_audio_buffer.speech_started","event_id":"event_"+uuid.uuid4().hex,"audio_start_ms":round(event.audio_start_ms or 0,1)})
+  elif kind=="speech_stopped":await emit({"type":"input_audio_buffer.speech_stopped","event_id":"event_"+uuid.uuid4().hex,"audio_end_ms":round(event.audio_end_ms or 0,1)})
+  elif kind=="committed":await emit({"type":"input_audio_buffer.committed","event_id":"event_"+uuid.uuid4().hex,"item_id":getattr(event,"item_id",None),"audio_start_ms":round(event.audio_start_ms or 0,1),"audio_end_ms":round(event.audio_end_ms or 0,1)})
+ try:
+  detector=await asyncio.to_thread(StreamingVad,Path(__file__).with_name("silero_vad.onnx"),SETTINGS.ws_vad_threshold,SETTINGS.ws_min_silence_ms,SETTINGS.ws_speech_pad_ms,SETTINGS.ws_max_utterance_ms);queue=asyncio.Queue(maxsize=2);state={"next":0,"id":None};worker=asyncio.create_task(run_turn_worker(websocket.app,queue,emit,session_id));await emit({"type":"session.created","event_id":"event_"+uuid.uuid4().hex,"session":session})
+  while True:
+   message=await websocket.receive()
+   if message["type"]=="websocket.disconnect":return
+   if message.get("bytes") is not None:await emit(realtime_error("unsupported_event","realtime endpoint accepts JSON events only"));continue
+   try:event=json.loads(message.get("text") or "")
+   except ValueError:await emit(realtime_error("invalid_event","event must be JSON"));continue
+   kind=event.get("type")
+   if kind=="input_audio_buffer.append":
+    if set(event)-{"type","audio"}:await emit(realtime_error("unsupported_event","unsupported append fields"));continue
+    try:pcm=base64.b64decode(event.get("audio",""),validate=True);pcm=pcm24_to_16(pcm)
+    except (ValueError,binascii.Error):await emit(realtime_error("invalid_audio","audio must be base64 PCM16 at 24 kHz"));continue
+    await run_vad_events(detector,await asyncio.to_thread(detector.feed,pcm),state,queue,emit,lifecycle)
+   elif kind=="input_audio_buffer.commit":
+    event_out=await asyncio.to_thread(detector.flush)
+    if event_out:await run_vad_events(detector,[VadEvent("speech_stopped",audio_end_ms=event_out.audio_end_ms),event_out],state,queue,emit,lifecycle)
+   elif kind=="input_audio_buffer.clear":await asyncio.to_thread(detector.clear);state["id"]=None
+   elif kind=="session.update":
+    update=event.get("session")
+    try:
+     if not isinstance(update,dict) or set(update)!={"turn_detection"} or not isinstance(update["turn_detection"],dict):raise ValueError("only session.turn_detection is supported")
+     turn=update["turn_detection"];mapping={"threshold":"threshold","silence_duration_ms":"min_silence_ms","prefix_padding_ms":"speech_pad_ms"}
+     if set(turn)-set(mapping):raise ValueError("unsupported turn_detection field")
+     values=vad_values({mapping[k]:v for k,v in turn.items()});await asyncio.to_thread(detector.configure,**values)
+     for key,value in turn.items():session["turn_detection"][key]=value
+     await emit({"type":"session.updated","event_id":"event_"+uuid.uuid4().hex,"session":session})
+    except ValueError as exc:await emit(realtime_error("invalid_session_update",str(exc)))
+   else:await emit(realtime_error("unsupported_event","unsupported realtime event"))
+ except WebSocketDisconnect:return
+ except Exception as exc:LOG.exception("Realtime VAD failure");await emit(realtime_error("realtime_unavailable",str(exc)))
+ finally:
+  if 'worker' in locals():worker.cancel()
+  STATS.websocket_connections_active-=1
 def enabled_value(value:str|None)->bool:return bool(value and value.lower() in {"1","true","yes","on"})
 @app.post("/v1/audio/transcriptions")
 async def transcribe(request:Request,file:UploadFile|None=File(None),audio_url:str|None=Form(None),model:str|None=Form(None),response_format:str=Form("json"),language:str|None=Form(None),prompt:str|None=Form(None),temperature:float|None=Form(None),timestamp_granularities:list[str]|None=Form(None,alias="timestamp_granularities[]"),authorization:str|None=Header(None),x_api_key:str|None=Header(None,alias="X-API-Key"),x_request_id:str|None=Header(None,alias="X-Request-ID")):
