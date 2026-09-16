@@ -188,14 +188,13 @@ def vad_values(value:dict[str,Any])->dict[str,Any]:
   else:raise ValueError(f"invalid VAD {key}")
  return out
 def realtime_error(code:str,message:str)->dict[str,Any]:return {"type":"error","error":{"type":"invalid_request_error","code":code,"message":message}}
-def pcm24_to_16(data:bytes)->bytes:
- """Linear 24 kHz PCM16 -> 16 kHz PCM16; realtime adapter only."""
+def pcm24_to_16(resampler,data:bytes)->bytes:
+ """Filtered 24 kHz PCM16 -> 16 kHz PCM16; realtime adapter only."""
  if len(data)%2:raise ValueError("audio must be PCM16")
- import numpy as np
- source=np.frombuffer(data,dtype="<i2")
- if not len(source):return b""
- target=np.interp(np.arange((len(source)*2)//3)*1.5,np.arange(len(source)),source).round().astype("<i2")
- return target.tobytes()
+ if not data:return b""
+ import av
+ frame=av.AudioFrame(format="s16",layout="mono",samples=len(data)//2);frame.sample_rate=24000;frame.planes[0].update(data)
+ return b"".join(bytes(memoryview(out.planes[0])[:out.samples*2]) for out in resampler.resample(frame))
 @dataclass
 class CompletedTurn:
  turn_id:str; audio:bytes; start_ms:float; end_ms:float; item_id:str|None=None
@@ -261,7 +260,7 @@ async def realtime_transcriptions(websocket:WebSocket):
  if not credentials_valid(websocket.headers.get("authorization"),websocket.query_params.get("api_key")):await websocket.close(code=1008,reason="invalid API key");return
  if websocket.query_params.get("intent","transcription")!="transcription" or (websocket.query_params.get("model") and websocket.query_params.get("model") not in SETTINGS.aliases):await websocket.close(code=1008,reason="transcription-only realtime endpoint");return
  await websocket.accept();STATS.websocket_connections_total+=1;STATS.websocket_connections_active+=1;session_id="sess_"+uuid.uuid4().hex;send_lock=asyncio.Lock()
- session={"id":session_id,"object":"realtime.transcription_session","model":MODEL_ID,"input_audio_format":"pcm16","input_audio_sample_rate_hz":24000,"turn_detection":{"threshold":SETTINGS.ws_vad_threshold,"silence_duration_ms":SETTINGS.ws_min_silence_ms,"prefix_padding_ms":SETTINGS.ws_speech_pad_ms}}
+ session={"id":session_id,"object":"realtime.transcription_session","type":"transcription","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"transcription":{"model":MODEL_ID,"language":"en"},"turn_detection":{"type":"server_vad","threshold":SETTINGS.ws_vad_threshold,"silence_duration_ms":SETTINGS.ws_min_silence_ms,"prefix_padding_ms":SETTINGS.ws_speech_pad_ms}}}}
  async def emit(value):
   async with send_lock:
    if isinstance(value,tuple):
@@ -274,7 +273,8 @@ async def realtime_transcriptions(websocket:WebSocket):
   elif kind=="speech_stopped":await emit({"type":"input_audio_buffer.speech_stopped","event_id":"event_"+uuid.uuid4().hex,"audio_end_ms":round(event.audio_end_ms or 0,1)})
   elif kind=="committed":await emit({"type":"input_audio_buffer.committed","event_id":"event_"+uuid.uuid4().hex,"item_id":getattr(event,"item_id",None),"audio_start_ms":round(event.audio_start_ms or 0,1),"audio_end_ms":round(event.audio_end_ms or 0,1)})
  try:
-  detector=await asyncio.to_thread(StreamingVad,Path(__file__).with_name("silero_vad.onnx"),SETTINGS.ws_vad_threshold,SETTINGS.ws_min_silence_ms,SETTINGS.ws_speech_pad_ms,SETTINGS.ws_max_utterance_ms);queue=asyncio.Queue(maxsize=2);state={"next":0,"id":None};worker=asyncio.create_task(run_turn_worker(websocket.app,queue,emit,session_id));await emit({"type":"session.created","event_id":"event_"+uuid.uuid4().hex,"session":session})
+  from av.audio.resampler import AudioResampler
+  detector=await asyncio.to_thread(StreamingVad,Path(__file__).with_name("silero_vad.onnx"),SETTINGS.ws_vad_threshold,SETTINGS.ws_min_silence_ms,SETTINGS.ws_speech_pad_ms,SETTINGS.ws_max_utterance_ms);resampler=AudioResampler(format="s16",layout="mono",rate=16000);queue=asyncio.Queue(maxsize=2);state={"next":0,"id":None};manual=bytearray();worker=asyncio.create_task(run_turn_worker(websocket.app,queue,emit,session_id));await emit({"type":"session.created","event_id":"event_"+uuid.uuid4().hex,"session":session})
   while True:
    message=await websocket.receive()
    if message["type"]=="websocket.disconnect":return
@@ -284,21 +284,40 @@ async def realtime_transcriptions(websocket:WebSocket):
    kind=event.get("type")
    if kind=="input_audio_buffer.append":
     if set(event)-{"type","audio"}:await emit(realtime_error("unsupported_event","unsupported append fields"));continue
-    try:pcm=base64.b64decode(event.get("audio",""),validate=True);pcm=pcm24_to_16(pcm)
+    try:pcm=base64.b64decode(event.get("audio",""),validate=True);pcm=pcm24_to_16(resampler,pcm)
     except (ValueError,binascii.Error):await emit(realtime_error("invalid_audio","audio must be base64 PCM16 at 24 kHz"));continue
-    await run_vad_events(detector,await asyncio.to_thread(detector.feed,pcm),state,queue,emit,lifecycle)
+    if session["audio"]["input"]["turn_detection"] is None:manual.extend(pcm)
+    else:await run_vad_events(detector,await asyncio.to_thread(detector.feed,pcm),state,queue,emit,lifecycle)
    elif kind=="input_audio_buffer.commit":
-    event_out=await asyncio.to_thread(detector.flush)
-    if event_out:await run_vad_events(detector,[VadEvent("speech_stopped",audio_end_ms=event_out.audio_end_ms),event_out],state,queue,emit,lifecycle)
-   elif kind=="input_audio_buffer.clear":await asyncio.to_thread(detector.clear);state["id"]=None
+    if session["audio"]["input"]["turn_detection"] is None:
+     tail=b"".join(bytes(memoryview(out.planes[0])[:out.samples*2]) for out in resampler.resample(None));manual.extend(tail)
+     if manual:
+      state["next"]+=1;turn=CompletedTurn(str(state["next"]),bytes(manual),0,len(manual)/32,"item_"+uuid.uuid4().hex);manual.clear()
+      if queue.full():await emit(realtime_error("turn_queue_full","completed-turn queue is full; turn was discarded"))
+      else:await queue.put(turn);await emit({"type":"input_audio_buffer.committed","event_id":"event_"+uuid.uuid4().hex,"item_id":turn.item_id,"audio_start_ms":0,"audio_end_ms":round(turn.end_ms,1)})
+    else:
+     event_out=await asyncio.to_thread(detector.flush)
+     if event_out:await run_vad_events(detector,[VadEvent("speech_stopped",audio_end_ms=event_out.audio_end_ms),event_out],state,queue,emit,lifecycle)
+   elif kind=="input_audio_buffer.clear":await asyncio.to_thread(detector.clear);manual.clear();state["id"]=None
    elif kind=="session.update":
     update=event.get("session")
     try:
-     if not isinstance(update,dict) or set(update)!={"turn_detection"} or not isinstance(update["turn_detection"],dict):raise ValueError("only session.turn_detection is supported")
-     turn=update["turn_detection"];mapping={"threshold":"threshold","silence_duration_ms":"min_silence_ms","prefix_padding_ms":"speech_pad_ms"}
-     if set(turn)-set(mapping):raise ValueError("unsupported turn_detection field")
-     values=vad_values({mapping[k]:v for k,v in turn.items()});await asyncio.to_thread(detector.configure,**values)
-     for key,value in turn.items():session["turn_detection"][key]=value
+     if not isinstance(update,dict) or set(update)-{"type","audio"} or update.get("type","transcription")!="transcription":raise ValueError("only transcription session.audio.input is supported")
+     audio=update.get("audio",{});inp=audio.get("input") if isinstance(audio,dict) else None
+     if not isinstance(inp,dict) or set(audio)!={"input"} or set(inp)-{"format","transcription","turn_detection"}:raise ValueError("unsupported session audio configuration")
+     if "format" in inp and inp["format"]!={"type":"audio/pcm","rate":24000}:raise ValueError("only 24 kHz audio/pcm input is supported")
+     if "transcription" in inp:
+      transcription=inp["transcription"]
+      if not isinstance(transcription,dict) or set(transcription)-{"model","language"}:raise ValueError("unsupported transcription configuration")
+      if transcription.get("model",MODEL_ID) not in SETTINGS.aliases or transcription.get("language","en").lower() not in {"en","eng","en-us"}:raise ValueError("Parakeet supports English transcription only")
+     if "turn_detection" not in inp:raise ValueError("session.audio.input.turn_detection is required")
+     turn=inp["turn_detection"]
+     if turn is None:session["audio"]["input"]["turn_detection"]=None;manual.clear();await asyncio.to_thread(detector.clear)
+     else:
+      mapping={"threshold":"threshold","silence_duration_ms":"min_silence_ms","prefix_padding_ms":"speech_pad_ms"}
+      if not isinstance(turn,dict) or turn.get("type")!="server_vad" or set(turn)-({"type"}|set(mapping)):raise ValueError("only server_vad turn detection is supported")
+      values=vad_values({mapping[k]:v for k,v in turn.items() if k in mapping});await asyncio.to_thread(detector.configure,**values)
+      current=session["audio"]["input"]["turn_detection"] or {"type":"server_vad"};current.update(turn);session["audio"]["input"]["turn_detection"]=current
      await emit({"type":"session.updated","event_id":"event_"+uuid.uuid4().hex,"session":session})
     except ValueError as exc:await emit(realtime_error("invalid_session_update",str(exc)))
    else:await emit(realtime_error("unsupported_event","unsupported realtime event"))
