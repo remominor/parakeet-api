@@ -116,25 +116,128 @@ async def download_audio(url:str)->bytes:
     return b"".join(chunks)
  except HTTPException:raise
  except (httpx.HTTPError,ValueError) as exc:raise HTTPException(422,f"could not download audio_url: {exc.__class__.__name__}") from exc
+class ModelManager:
+ """Owns the native engine process and its CUDA lifetime."""
+ def __init__(self):
+  self.state="unloaded";self.process:asyncio.subprocess.Process|None=None;self.lock=asyncio.Lock();self.idle=asyncio.Event();self.idle.set();self.admitted=0;self.task:asyncio.Task|None=None;self.watcher:asyncio.Task|None=None;self.stopping=False;self.load_after_unload=False;self.app:FastAPI|None=None;self.telemetry_pid: int|None=None;self.telemetry_at=0.;self.telemetry=(None,0)
+ async def is_loaded(self)->bool:
+  async with self.lock:return self.state=="loaded"
+ async def request_load(self,app:FastAPI)->tuple[str,bool]:
+  async with self.lock:
+   self.app=app
+   if self.state=="loaded":return self.state,False
+   if self.state=="loading":return self.state,True
+   if self.state=="unloading":self.load_after_unload=True;return self.state,True
+   self.state="loading";self.task=asyncio.create_task(self._load(app));return self.state,True
+ async def request_unload(self)->tuple[str,bool]:
+  async with self.lock:
+   if self.state=="unloaded":return self.state,False
+   if self.state=="unloading":return self.state,True
+   self.state="unloading";self.task=asyncio.create_task(self._unload());return self.state,True
+ @asynccontextmanager
+ async def admit(self):
+  async with self.lock:
+   if self.state!="loaded":raise HTTPException(503,"model_unavailable")
+   self.admitted+=1;self.idle.clear()
+  try:yield
+  finally:
+   async with self.lock:
+    self.admitted-=1
+    if not self.admitted:self.idle.set()
+ async def _load(self,app:FastAPI):
+  process=None
+  try:
+   model_path=f"/models/{os.getenv('PARAKEET_MODEL_FILE','tdt-0.6b-v2-f16.gguf')}"
+   process=await asyncio.create_subprocess_exec("parakeet-server","--host","127.0.0.1","--port","8081","--model",model_path)
+   async with self.lock:
+    if self.state!="loading":
+     process.terminate();await process.wait();return
+    self.process=process;self.telemetry_pid=None;self.watcher=asyncio.create_task(self._watch(process))
+   silence=wav_bytes(b"\0\0"*(TARGET_RATE//2))
+   for _ in range(60):
+    if process.returncode is not None:raise RuntimeError(f"engine exited with status {process.returncode}")
+    try:
+     response=await app.state.client.post("http://127.0.0.1:8081/v1/audio/transcriptions",files={"file":("warmup.wav",silence,"audio/wav")},data={"response_format":"json"},timeout=120)
+     if response.status_code==200:
+      async with self.lock:
+       if self.state=="loading":self.state="loaded";LOG.info("model warm and ready")
+      return
+    except httpx.HTTPError:pass
+    await asyncio.sleep(2)
+   raise RuntimeError("engine did not become ready")
+  except asyncio.CancelledError:
+   if process and process.returncode is None:
+    process.terminate();await process.wait()
+   raise
+  except Exception as exc:
+   LOG.error("model load failed: %s",exc)
+   async with self.lock:
+    if self.state=="loading":self.state="error"
+   if process and process.returncode is None:
+    process.terminate();await process.wait()
+ async def _watch(self,process:asyncio.subprocess.Process):
+  code=await process.wait()
+  async with self.lock:
+   if self.process is process:
+    self.process=None;self.telemetry_pid=None
+    if self.state in {"loading","loaded"}:self.state="error";LOG.error("engine exited unexpectedly with status %s",code)
+ async def _unload(self):
+  await self.idle.wait()
+  async with self.lock:process=self.process
+  if process and process.returncode is None:
+   process.terminate()
+   try:await asyncio.wait_for(process.wait(),timeout=15)
+   except TimeoutError:
+    LOG.warning("engine did not stop after SIGTERM; sending SIGKILL");process.kill();await process.wait()
+  async with self.lock:
+   self.process=None;self.telemetry_pid=None
+   follow_up=self.load_after_unload;self.load_after_unload=False
+   if self.state=="unloading":self.state="unloaded"
+  if follow_up and self.app:await self.request_load(self.app)
+ async def shutdown(self):
+  async with self.lock:
+   self.stopping=True
+   if self.state!="unloaded":self.state="unloading"
+  if self.task and not self.task.done():self.task.cancel()
+  async with self.lock:process=self.process
+  if process and process.returncode is None:
+   process.terminate()
+   try:await asyncio.wait_for(process.wait(),timeout=15)
+   except TimeoutError:process.kill();await process.wait()
+ async def gpu_metrics(self)->tuple[str|None,int]:
+  async with self.lock:pid=self.process.pid if self.process and self.process.returncode is None else None
+  if pid is None:return None,0
+  if self.telemetry_pid==pid and time.monotonic()-self.telemetry_at<1:return self.telemetry
+  try:
+   async def query(*args):
+    proc=await asyncio.create_subprocess_exec("nvidia-smi",*args,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+    out,_=await asyncio.wait_for(proc.communicate(),timeout=.5)
+    return out.decode().strip().splitlines() if proc.returncode==0 else []
+   gpus,apps=await asyncio.gather(query("--query-gpu=index,uuid","--format=csv,noheader,nounits"),query("--query-compute-apps=pid,process_name,gpu_uuid,used_memory","--format=csv,noheader,nounits"))
+   gpu_index={parts[1].strip():parts[0].strip() for line in gpus if len(parts:=line.split(","))==2}
+   candidates=[]
+   for line in apps:
+    parts=[x.strip() for x in line.split(",")]
+    if len(parts)==4 and (parts[0]==str(pid) or parts[1].endswith("parakeet-server")):candidates.append(parts)
+   if len(candidates)==1:
+    _,_,gpu_uuid,memory=candidates[0];value=(f"cuda:{gpu_index[gpu_uuid]}" if gpu_uuid in gpu_index else None,int(float(memory)));self.telemetry_pid=pid;self.telemetry_at=time.monotonic();self.telemetry=value;return value
+  except (FileNotFoundError,TimeoutError,ValueError):pass
+  self.telemetry_pid=pid;self.telemetry_at=time.monotonic();self.telemetry=(None,0);return self.telemetry
+ async def health(self)->dict[str,Any]:
+  async with self.lock:state=self.state
+  device,used=await self.gpu_metrics()
+  return {"status":"ready" if state=="loaded" else "unavailable","model":MODEL_ID,"model_state":state,"device":device,"vram_allocated_mb":used,"vram_reserved_mb":used}
 @asynccontextmanager
 async def lifespan(app:FastAPI):
- app.state.started=time.monotonic();app.state.client=httpx.AsyncClient(timeout=httpx.Timeout(SETTINGS.timeout,connect=2),limits=httpx.Limits(max_keepalive_connections=0,max_connections=1),headers={"Connection":"close"});app.state.ready=False;asyncio.create_task(warm(app))
+ app.state.started=time.monotonic();app.state.client=httpx.AsyncClient(timeout=httpx.Timeout(SETTINGS.timeout,connect=2),limits=httpx.Limits(max_keepalive_connections=0,max_connections=1),headers={"Connection":"close"});app.state.model=ModelManager();await app.state.model.request_load(app)
  try:yield
- finally:await app.state.client.aclose()
-async def warm(app:FastAPI):
- silence=wav_bytes(b"\0\0"*(TARGET_RATE//2))
- for _ in range(60):
-  try:
-   response=await app.state.client.post("http://127.0.0.1:8081/v1/audio/transcriptions",files={"file":("warmup.wav",silence,"audio/wav")},data={"response_format":"json"},timeout=120)
-   if response.status_code==200:app.state.ready=True;LOG.info("model warm and ready");return
-  except httpx.HTTPError:pass
-  await asyncio.sleep(2)
- LOG.error("model did not become ready")
-async def engine_transcribe(client:httpx.AsyncClient,payload:bytes,form:dict[str,Any],*,parse_json=True)->tuple[dict[str,Any]|str,float]:
+ finally:await app.state.model.shutdown();await app.state.client.aclose()
+async def engine_transcribe(app:FastAPI,payload:bytes,form:dict[str,Any],*,parse_json=True)->tuple[dict[str,Any]|str,float]:
  STATS.requests_queued+=1
  try:
-  async with INFERENCE:
-   STATS.requests_queued-=1;started=time.perf_counter();response=await client.post("http://127.0.0.1:8081/v1/audio/transcriptions",files={"file":("audio.wav",payload,"audio/wav")},data=form);engine_ms=(time.perf_counter()-started)*1000
+  async with app.state.model.admit():
+   async with INFERENCE:
+    STATS.requests_queued-=1;started=time.perf_counter();response=await app.state.client.post("http://127.0.0.1:8081/v1/audio/transcriptions",files={"file":("audio.wav",payload,"audio/wav")},data=form);engine_ms=(time.perf_counter()-started)*1000
  except httpx.HTTPError as exc:raise HTTPException(502,f"speech engine unavailable: {exc.__class__.__name__}") from exc
  finally:STATS.requests_queued=max(0,STATS.requests_queued)
  if response.status_code!=200:raise HTTPException(response.status_code,response.text[:400] or "speech engine failed")
@@ -151,9 +254,21 @@ async def correlation_id(request:Request,call_next):
 @app.exception_handler(HTTPException)
 async def errors(_:Request,exc:HTTPException):return JSONResponse(status_code=exc.status_code,content={"error":{"message":str(exc.detail),"type":"invalid_request_error" if exc.status_code<500 else "server_error","code":exc.status_code}})
 @app.get("/health")
-async def health():return {"status":"ok"}
+async def health(request:Request):
+ body=await request.app.state.model.health();return JSONResponse(status_code=200 if body["model_state"]=="loaded" else 503,content=body)
 @app.get("/readyz")
-async def readyz(request:Request):return JSONResponse(status_code=200 if request.app.state.ready else 503,content={"ready":bool(request.app.state.ready),"model":MODEL_ID})
+async def readyz(request:Request):
+ body=await request.app.state.model.health();body["ready"]=body["model_state"]=="loaded";return JSONResponse(status_code=200 if body["ready"] else 503,content=body)
+async def model_lifecycle(request:Request,action:str,authorization:str|None,x_api_key:str|None):
+ auth(authorization,x_api_key)
+ state,pending=await (request.app.state.model.request_load(request.app) if action=="load" else request.app.state.model.request_unload())
+ return JSONResponse(status_code=202 if pending else 200,content={"model":MODEL_ID,"model_state":state,"status":"accepted" if pending else "complete"})
+@app.post("/internal/model/load")
+@app.post("/v1/model/load")
+async def load_model(request:Request,authorization:str|None=Header(None),x_api_key:str|None=Header(None,alias="X-API-Key")):return await model_lifecycle(request,"load",authorization,x_api_key)
+@app.post("/internal/model/unload")
+@app.post("/v1/model/unload")
+async def unload_model(request:Request,authorization:str|None=Header(None),x_api_key:str|None=Header(None,alias="X-API-Key")):return await model_lifecycle(request,"unload",authorization,x_api_key)
 @app.get("/v1/models")
 async def models(authorization:str|None=Header(None),x_api_key:str|None=Header(None,alias="X-API-Key")):
  auth(authorization,x_api_key);return {"object":"list","data":[{"id":MODEL_ID,"object":"model","created":0,"owned_by":"parakeet.cpp"}]}
@@ -201,7 +316,7 @@ class CompletedTurn:
 async def run_turn_worker(app:FastAPI,queue:asyncio.Queue[CompletedTurn],emit,session_id:str):
  while True:
   turn=await queue.get();STATS.requests_total+=1;STATS.requests_active+=1;STATS.websocket_turns_total+=1;started=time.perf_counter()
-  try:result,engine_ms=await engine_transcribe(app.state.client,wav_bytes(turn.audio),{"response_format":"verbose_json","timestamp_granularities[]":["word"]})
+  try:result,engine_ms=await engine_transcribe(app,wav_bytes(turn.audio),{"response_format":"verbose_json","timestamp_granularities[]":["word"]})
   except HTTPException as exc:STATS.requests_failed+=1;await emit(realtime_error("transcription_failed",str(exc.detail))|{"turn_id":turn.turn_id});queue.task_done();continue
   finally:STATS.requests_active-=1
   assert isinstance(result,dict);total_ms=(time.perf_counter()-started)*1000;STATS.ws_ms.append(total_ms);STATS.engine_ms.append(engine_ms);STATS.engine_ms_sum+=engine_ms;STATS.total_ms_sum+=total_ms;STATS.audio_seconds_total+=len(turn.audio)/32000
@@ -218,6 +333,7 @@ async def run_vad_events(detector:StreamingVad,events:list[VadEvent],turn_state:
 @app.websocket("/v1/audio/transcriptions/ws")
 async def stream_transcriptions(websocket:WebSocket):
  if not credentials_valid(websocket.headers.get("authorization"),websocket.query_params.get("api_key")):await websocket.close(code=1008,reason="invalid API key");return
+ if not await websocket.app.state.model.is_loaded():await websocket.close(code=1013,reason="model unavailable");return
  await websocket.accept();STATS.websocket_connections_total+=1;STATS.websocket_connections_active+=1;verbose=enabled_value(websocket.query_params.get("verbose"));session_id=request_id(websocket.headers.get("x-request-id"));send_lock=asyncio.Lock()
  async def emit(value):
   async with send_lock:
@@ -259,6 +375,7 @@ async def stream_transcriptions(websocket:WebSocket):
 async def realtime_transcriptions(websocket:WebSocket):
  if not credentials_valid(websocket.headers.get("authorization"),websocket.query_params.get("api_key")):await websocket.close(code=1008,reason="invalid API key");return
  if websocket.query_params.get("intent","transcription")!="transcription" or (websocket.query_params.get("model") and websocket.query_params.get("model") not in SETTINGS.aliases):await websocket.close(code=1008,reason="transcription-only realtime endpoint");return
+ if not await websocket.app.state.model.is_loaded():await websocket.close(code=1013,reason="model unavailable");return
  await websocket.accept();STATS.websocket_connections_total+=1;STATS.websocket_connections_active+=1;session_id="sess_"+uuid.uuid4().hex;send_lock=asyncio.Lock()
  session={"id":session_id,"object":"realtime.transcription_session","type":"transcription","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"transcription":{"model":MODEL_ID,"language":"en"},"turn_detection":{"type":"server_vad","threshold":SETTINGS.ws_vad_threshold,"silence_duration_ms":SETTINGS.ws_min_silence_ms,"prefix_padding_ms":SETTINGS.ws_speech_pad_ms}}}}
  async def emit(value):
@@ -330,6 +447,7 @@ def enabled_value(value:str|None)->bool:return bool(value and value.lower() in {
 @app.post("/v1/audio/transcriptions")
 async def transcribe(request:Request,file:UploadFile|None=File(None),audio_url:str|None=Form(None),model:str|None=Form(None),response_format:str=Form("json"),language:str|None=Form(None),prompt:str|None=Form(None),temperature:float|None=Form(None),timestamp_granularities:list[str]|None=Form(None,alias="timestamp_granularities[]"),authorization:str|None=Header(None),x_api_key:str|None=Header(None,alias="X-API-Key"),x_request_id:str|None=Header(None,alias="X-Request-ID")):
  auth(authorization,x_api_key);valid_model(model);validate_options(language,prompt,temperature);rid=request.state.request_id
+ if not await request.app.state.model.is_loaded():raise HTTPException(503,"model_unavailable")
  if bool(file and file.filename)==bool(audio_url and audio_url.strip()):raise HTTPException(400,"provide exactly one of file or audio_url")
  output=(response_format or "json").lower()
  if output not in FORMATS:raise HTTPException(400,f"response_format must be one of {', '.join(sorted(FORMATS))}")
@@ -343,7 +461,7 @@ async def transcribe(request:Request,file:UploadFile|None=File(None),audio_url:s
  if needs_words and "word" not in granularity:granularity.append("word")
  form={"response_format":"verbose_json" if needs_words else output}
  if granularity:form["timestamp_granularities[]"]=granularity
- try:result,engine_ms=await engine_transcribe(request.app.state.client,payload,form,parse_json=output!="text")
+ try:result,engine_ms=await engine_transcribe(request.app,payload,form,parse_json=output!="text")
  except HTTPException:STATS.requests_failed+=1;raise
  finally:STATS.requests_active-=1
  total_ms=(time.perf_counter()-started)*1000;STATS.request_ms.append(total_ms);STATS.engine_ms.append(engine_ms);STATS.total_ms_sum+=total_ms;STATS.engine_ms_sum+=engine_ms;headers={"X-Request-ID":rid,"X-Parakeet-Model":MODEL_ID,"X-Parakeet-Engine-Ms":f"{engine_ms:.1f}","X-Parakeet-Total-Ms":f"{total_ms:.1f}","X-Parakeet-Transcoded":"1" if converted else "0"}

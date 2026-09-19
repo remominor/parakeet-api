@@ -15,4 +15,13 @@ curl -sS -o /dev/null -D - "${auth[@]}" -H 'X-Request-ID: smoke-request-1' -F "f
 curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" -F "file=@$sample" -F 'language=fr' "$base_url/v1/audio/transcriptions" | grep -qx '422'
 curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" -F "file=@$sample" -F 'prompt=ignored' "$base_url/v1/audio/transcriptions" | grep -qx '422'
 curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" -F "file=@$sample" -F 'temperature=0.1' "$base_url/v1/audio/transcriptions" | grep -qx '422'
+curl -fsS -X POST "${auth[@]}" "$base_url/internal/model/unload" | grep -q '"model_state":"unloading"'
+curl -sS -o /dev/null -w '%{http_code}' "$base_url/health" | grep -qx '503'
+curl -fsS -X POST "${auth[@]}" "$base_url/v1/model/load" | grep -q '"status":"accepted"'
+for _ in $(seq 1 60); do
+  if curl -fsS "$base_url/health" | grep -q '"model_state":"loaded"'; then break; fi
+  sleep 2
+done
+curl -fsS "$base_url/health" | grep -q '"status":"ready"'
+curl -fsS "${auth[@]}" -F "file=@$sample" "$base_url/v1/audio/transcriptions" | grep -q '"text"'
 echo "smoke test passed"

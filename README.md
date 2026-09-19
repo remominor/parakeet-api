@@ -62,9 +62,21 @@ curl http://127.0.0.1:5092/v1/audio/transcriptions \
 - `POST /v1/audio/transcriptions`: WAV, MP3, OGG, WebM, FLAC, and M4A uploads;
   `json`, `text`, `verbose_json`, `srt`, and `vtt` response formats.
 - `GET /v1/models`: returns `parakeet-tdt-0.6b-v2`.
-- `GET /health`, `GET /readyz`, authenticated `GET /stats`, and authenticated
-  `GET /info` support operation and capability discovery. Each transcription
-  response includes `X-Request-ID` (or preserves a valid supplied value).
+- `GET /health` and `GET /readyz` return model readiness plus engine-process GPU
+  memory. They return `200` only when the model is loaded, otherwise `503` while
+  the gateway stays available for lifecycle control. Authenticated `GET /stats`
+  and `GET /info` support operation and capability discovery.
+- Authenticated `POST /internal/model/load` and `/internal/model/unload` (also
+  available as `/v1/model/load` and `/v1/model/unload`) asynchronously load or
+  unload the CUDA engine. They return `202` while a transition is in progress;
+  poll `/health` until its `model_state` is `loaded`.
+
+When loaded, health includes the host GPU index and the native engine process's
+reported VRAM use (the native backend has no separate allocator-reserved value):
+
+```json
+{"status":"ready","model":"parakeet-tdt-0.6b-v2","model_state":"loaded","device":"cuda:1","vram_allocated_mb":1842,"vram_reserved_mb":1842}
+```
 - Uploads are capped while streaming. An `audio_url` form field supports
   `http`/`https` inputs, with redirects and private/local addresses rejected
   by default; use `PARAKEET_URL_ALLOWED_HOSTS` for trusted internal hosts.
