@@ -1,0 +1,5 @@
+# Opt-in only: production uses ONNX Runtime + kaldi-native-fbank.
+torch==2.8.0
+torchaudio==2.8.0
+modelscope==1.29.2
+onnx==1.18.0

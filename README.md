@@ -1,146 +1,171 @@
-# Parakeet TDT OpenAI API
+# Parakeet local speech-intelligence API
 
-One CUDA Docker container serving NVIDIA Parakeet TDT 0.6B v2 as an
-OpenAI-compatible local-network transcription API. The image runs the native
-`parakeet.cpp` GGUF engine and a small API gateway; only port 8080 is exposed.
+A single CUDA container exposes an OpenAI-compatible transcription gateway on
+port `5092`. Inference is in-process through transcribe.cpp; there is no CLI
+output parsing or speech-engine sidecar. Completed-turn WebSockets retain
+Silero VAD and do not provide token-by-token partials.
 
-It is optimized for completed, short voice-agent turns. It does not produce
-live partial transcripts while the user is speaking.
+## Pinned runtime and models
 
-## Requirements
+- transcribe.cpp `v0.2.3`, commit `63a44d9239d610b3908e8a66b384924cd4a77217`
+- Unified Q8 (default), 731,357,568 bytes,
+  `4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b41ef2f38795`
+- transcribe.cpp TDT-v2 Q8 (rollback), 729,574,912 bytes,
+  `f0d0e99cebb6d3b83f1f7069b82b5d3c2e39a54545b0da039cb4bafd9c4e5caa`
+- Sortformer v2.1 Q8, 139,310,336 bytes,
+  `a5dacdc650790266c7a362e54e6bf51952015487edaa606c4e11632bc32442a9`
+- English VoxCeleb CAM++, 29,596,978 bytes,
+  `357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b`
 
-- Docker Compose v2
-- NVIDIA GPU, driver, and NVIDIA Container Toolkit
-- One GGUF under `./models/`
-
-| Precision | File | Use |
-|---|---|---|
-| F16 | `tdt-0.6b-v2-f16.gguf` | Default, highest fidelity |
-| Q8 | `tdt-0.6b-v2-q8_0.gguf` | Lower memory use |
-
-The F16 model already present in this checkout is used by default. Download Q8
-from the `mudler/parakeet-cpp-gguf` collection and validate it against
-`models/SHA256SUMS.txt` before use.
-
-## Local benchmark
-
-Measured on this setup after model and CUDA-graph warm-up:
-
-- GPU: NVIDIA GeForce RTX 4070 Ti SUPER (16 GB VRAM)
-- Input: bundled 12-second 16 kHz WAV (`sample.wav`)
-- API path: local HTTP, WAV passthrough, `verbose_json` with word timestamps
-
-| Model | Warm engine / total time | Result |
-|---|---:|---|
-| F16 | 80.4 ms | Reference transcript |
-| Q8 | 51.6 ms | Same transcript as F16 |
-
-Q8 was about **1.56× faster** in this single-request check while also using
-less VRAM, so it is the recommended default for this host. These timings are
-not a general throughput claim: repeat them with representative utterance
-lengths and concurrent voice sessions before using them as a capacity estimate.
+The older 903-MB `tdt-0.6b-v2-q8_0.gguf` is a parakeet.cpp artifact and is not
+compatible with transcribe.cpp. It is intentionally rejected. Verify the
+files with `(cd models && sha256sum -c SHA256SUMS.txt)` (missing historical
+files may be reported separately).
 
 ## Run
 
 ```bash
-cp .env.example .env
-# Set PARAKEET_API_KEYS in .env
+mkdir -p data/speakers
 docker compose up --build
 ```
 
-The service listens on `http://127.0.0.1:5092` by default. Choose Q8 by setting
-`PARAKEET_MODEL_FILE=tdt-0.6b-v2-q8_0.gguf` in `.env`, then restart the service.
+Models may be mounted at `/models/{asr,diarization,campp}` or at `/models`.
+`PARAKEET_ASR_MODEL_FILE` has precedence; `PARAKEET_MODEL_FILE` remains a
+compatibility fallback. Unified is the default. Set
+`PARAKEET_ASR_MODEL_FILE=parakeet-tdt-0.6b-v2-Q8_0.gguf` for rollback.
+
+Sortformer and identity are opt-in:
+
+```dotenv
+PARAKEET_DIARIZATION_ENABLED=true
+PARAKEET_IDENTITY_ENABLED=true
+```
+
+The service accepts `parakeet`, `parakeet-en`, and `whisper-1`. It advertises
+the actual loaded model as `parakeet-unified-en-0.6b` or
+`parakeet-tdt-0.6b-v2`; the exact TDT ID is accepted only while TDT is loaded.
+
+## APIs
+
+`POST /v1/audio/transcriptions` preserves `json`, `text`, `verbose_json`,
+`srt`, and `vtt`, file/URL rules, authentication, request IDs, timing headers,
+and WAV passthrough semantics. Add `speech_context=diarization` or `full` to a
+JSON response. Enriched requests always include timed words and a
+`speech_context` object with segments, speakers, attribution, overlap
+statistics, component state, timing, and machine-readable degradation errors.
+ASR failure fails the request; optional enrichment fails open.
 
 ```bash
 curl http://127.0.0.1:5092/v1/audio/transcriptions \
   -H 'Authorization: Bearer YOUR_KEY' \
-  -F file=@sample.wav -F model=parakeet
+  -F file=@sample.wav -F model=parakeet \
+  -F response_format=verbose_json -F speech_context=full
 ```
 
-## API
+Additional authenticated endpoints:
 
-- `POST /v1/audio/transcriptions`: WAV, MP3, OGG, WebM, FLAC, and M4A uploads;
-  `json`, `text`, `verbose_json`, `srt`, and `vtt` response formats.
-- `GET /v1/models`: returns `parakeet-tdt-0.6b-v2`.
-- `GET /health` and `GET /readyz` return model readiness plus engine-process GPU
-  memory. They return `200` only when the model is loaded, otherwise `503` while
-  the gateway stays available for lifecycle control. Authenticated `GET /stats`
-  and `GET /info` support operation and capability discovery.
-- Authenticated `POST /internal/model/load` and `/internal/model/unload` (also
-  available as `/v1/model/load` and `/v1/model/unload`) asynchronously load or
-  unload the CUDA engine. They return `202` while a transition is in progress;
-  poll `/health` until its `model_state` is `loaded`.
+- `POST /v1/audio/diarizations` (`file` or `audio_url`, `identify=false`)
+- `POST /v1/speakers/enroll` (`speaker_id`, optional `display_name`, repeated
+  `files`)
+- `GET /v1/speakers` and `GET /v1/speakers/{speaker_id}`
+- `DELETE /v1/speakers/{speaker_id}`
+- `POST /v1/speakers/verify` (one `file`, optional `speaker_id`)
+- `POST /v1/model/load` and `POST /v1/model/unload`
+- `GET /health`, `/readyz`, `/info`, `/stats`, and opt-in `/metrics`
 
-When loaded, health includes the host GPU index and the native engine process's
-reported VRAM use (the native backend has no separate allocator-reserved value):
+`/readyz` is ASR decisive: optional component degradation does not make the
+service unready. GPU memory is process-level because native per-model
+allocation is unavailable; component VRAM remains `null` rather than being
+invented.
+
+### Speaker identity and privacy
+
+CAM++ uses 16-kHz audio, 80-bin Kaldi-compatible fbank, dither 0, per-utterance
+feature mean subtraction, and L2-normalized 512-D embeddings. Identity uses
+only non-overlapping diarized regions of at least 500 ms, requires 1,500 ms of
+usable audio by default, rejects near-silence, and caps processing at 15 s per
+speaker.
+
+Templates are atomic mode-`0600` JSON records in `/data/speakers`; the
+directory is mode `0700`. Public APIs never return an embedding. Corrupt or
+model-incompatible records are listed as incompatible and excluded from
+matching. Enrollment never overwrites an ID.
+
+Threshold and ambiguity margin are unset by default. Enrollment and embedding
+remain available, but matching returns `calibration_required`; full-context
+transcription still returns diarization. Calibrate from a labeled JSONL file:
 
 ```json
-{"status":"ready","model":"parakeet-tdt-0.6b-v2","model_state":"loaded","device":"cuda:1","vram_allocated_mb":1842,"vram_reserved_mb":1842}
+{"speaker_id":"alice","audio":"fixtures/alice-1.wav"}
+{"speaker_id":"alice","audio":"fixtures/alice-2.wav"}
+{"speaker_id":"bob","audio":"fixtures/bob-1.wav"}
 ```
-- Uploads are capped while streaming. An `audio_url` form field supports
-  `http`/`https` inputs, with redirects and private/local addresses rejected
-  by default; use `PARAKEET_URL_ALLOWED_HOSTS` for trusted internal hosts.
-- `verbose_json`, SRT, and VTT use timestamp-aware segments derived from native
-  word metadata. WebSocket final events include aggregate confidence; append
-  `?verbose=true` to include the native word list.
-
-### Voice-turn WebSocket
-
-`ws://HOST/v1/audio/transcriptions/ws` accepts raw, little-endian PCM16 mono
-audio at 16 kHz. Send binary frames only (up to 65,536 bytes each). The server
-uses CPU Silero VAD to identify voice turns and sends JSON lifecycle events:
-
-```json
-{"type":"ready","sample_rate":16000,"model":"parakeet-tdt-0.6b-v2"}
-{"type":"speech_started","turn_id":"1","audio_start_ms":120.0}
-{"type":"speech_stopped","turn_id":"1","audio_end_ms":1234.0}
-{"type":"final","turn_id":"1","text":"...","duration_ms":1234.0,"engine_ms":25.1,"total_ms":25.3,"confidence":{"mean":0.95,"min":0.82,"low_word_count":0}}
-```
-
-The endpoint emits final transcription only after 350 ms of detected silence
-or an 8-second maximum turn. Continue sending silence frames after a caller
-stops speaking so VAD can close the final turn. It is VAD-endpointed streaming,
-not token-by-token partial ASR.
-
-When API keys are enabled, authenticate with `Authorization: Bearer TOKEN` or
-`?api_key=TOKEN` (use the latter only for browser clients that cannot attach
-headers during the WebSocket handshake).
-
-The native socket also accepts JSON control events without closing the socket:
-`{"type":"commit"}` finalizes the active turn immediately,
-`{"type":"clear"}` discards it, and `{"type":"config","vad":{...}}`
-overrides VAD settings for that connection. Completed turns are queued (depth
-2) while the single GPU inference worker remains serialized; excess completed
-turns receive an explicit `turn_queue_full` error rather than growing memory.
-
-### OpenAI-style realtime transcription
-
-`ws://HOST/v1/realtime?model=parakeet&intent=transcription` is a thin
-transcription-only protocol adapter. It accepts `session.update`,
-`input_audio_buffer.append` (base64 PCM16 at 24 kHz), `commit`, and `clear`.
-It emits VAD lifecycle, committed-item, and completed-transcription events.
-Parakeet produces completed turns only: it does not emit synthetic partial
-transcript deltas.
-
-Tune endpointing through `PARAKEET_WS_VAD_THRESHOLD`,
-`PARAKEET_WS_MIN_SILENCE_MS`, `PARAKEET_WS_SPEECH_PAD_MS`, and
-`PARAKEET_WS_MAX_UTTERANCE_MS`. Silero VAD is bundled as a pinned ONNX asset in
-the image; it runs on CPU, keeping GPU memory available for ASR.
-
-`parakeet`, `parakeet-en`, and `whisper-1` are accepted aliases. API keys are
-optional only when `PARAKEET_API_KEYS` is blank; keep authentication enabled for
-any network reachable beyond a trusted host.
-
-For the WAV voice-agent hot path, inspect `X-Parakeet-Engine-Ms` and
-`X-Parakeet-Total-Ms` response headers. Non-WAV uploads are decoded before
-inference and include `X-Parakeet-Transcoded: 1`.
-
-Set `PARAKEET_METRICS_ENABLED=true` to expose a dependency-free Prometheus
-text endpoint at `/metrics`. Set `PARAKEET_WEBUI_ENABLED=true` to expose the
-small local drag-and-drop UI at `/`; it has no server-side state.
-
-Run the basic check after readiness:
 
 ```bash
-PARAKEET_STT_API_KEY=YOUR_KEY ./scripts/smoke-test.sh
+python scripts/calibrate-speakers.py manifest.jsonl \
+  --model models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
 ```
+
+The command reports same/different distributions and candidate threshold and
+margin ranges; it never changes configuration. Validate the prebuilt ONNX
+against a fresh official export with `scripts/validate-campp-parity.py`; every
+fixture must achieve cosine similarity `>= 0.99999`. Torch, Torchaudio, and
+ModelScope exist only in `gateway/requirements-campp-parity.txt`, not the
+production image.
+
+## WebSockets
+
+- `/v1/audio/transcriptions/ws`: raw PCM16 mono at 16 kHz, native lifecycle
+  events, `commit`, `clear`, and per-connection VAD configuration.
+- `/v1/realtime`: OpenAI-style transcription sessions, base64 PCM16 at 24 kHz,
+  server VAD or manual commit.
+
+Both use the same in-process ASR abstraction. Queue depth remains two,
+oversized frames are rejected, and no WebSocket diarization is performed.
+
+## Verification and benchmarking
+
+Normal tests do not download models or require CUDA:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Set `PARAKEET_REAL_ASR_MODEL`, `PARAKEET_REAL_DIARIZATION_MODEL`, and/or
+`PARAKEET_REAL_CAMPP_MODEL` for opt-in native tests. The benchmark harness
+covers 2.5 s, 7.5 s, and 12 s clips and records transcript, words, timings,
+model size, and process VRAM:
+
+```bash
+python scripts/benchmark.py --output report.json \
+  --model-file models/parakeet-unified-en-0.6b-Q8_0.gguf
+```
+
+See [the measured RTX 4070 Ti SUPER development report](docs/benchmark-rtx4070ti-super.md)
+and use [the report template](docs/benchmark-report-template.md) for old
+parakeet.cpp TDT, transcribe.cpp TDT, Unified, sequential/concurrent
+Sortformer, and full-stack comparisons. Development may use the RTX 4070 Ti
+SUPER, but release latency, concurrency, VRAM, and parity gates must be run on
+the RTX 3070. Sequential enrichment is the default; concurrency must not be
+enabled without the documented 10% full-context p95 win and adequate headroom.
+
+## Configuration
+
+Important variables are `PARAKEET_API_KEYS`, `PARAKEET_ASR_MODEL_FILE`,
+`PARAKEET_DIARIZATION_ENABLED`, `PARAKEET_DIARIZATION_MODEL_FILE`,
+`PARAKEET_IDENTITY_ENABLED`, `PARAKEET_CAMPP_MODEL_FILE`,
+`PARAKEET_ASR_DEVICE`, `PARAKEET_DIARIZATION_DEVICE`,
+`PARAKEET_SPEAKER_STORE`, `PARAKEET_IDENTITY_THRESHOLD`,
+`PARAKEET_IDENTITY_MARGIN`, `PARAKEET_IDENTITY_MINIMUM_AUDIO_MS`, and the
+`PARAKEET_CAMPP_*THREADS`/`CONCURRENCY` controls. Docker/NVIDIA visibility
+controls still determine which devices exist; selectors resolve exact devices
+from `transcribe_cpp.backends()`.
+
+Word confidence intentionally changed from parakeet.cpp max probability to the
+minimum native entropy-based token confidence belonging to each word.
+
+## Milestone 2
+
+Stateful WebSocket diarization is explicitly deferred. Guest tracking, speech
+separation, and other stateful multi-turn speaker behavior are also out of
+scope for this milestone.

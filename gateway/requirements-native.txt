@@ -1,0 +1,3 @@
+# For host-side real-model tests. The production image builds this binding
+# from the same pinned transcribe.cpp source tree as libtranscribe.
+transcribe-cpp==0.2.3

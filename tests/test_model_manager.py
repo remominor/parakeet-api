@@ -1,13 +1,27 @@
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from gateway.app import MODEL_ID, ModelManager
+from gateway.manager import StackConfig
 
 
 class DeadProcess:
     pid = 1234
     returncode = 0
+
+
+class FakeBackend:
+    device = "cpu"
+    async def warm(self): pass
+    async def close(self): pass
+
+
+class FakeEmbedding:
+    async def close(self): pass
 
 
 class ModelManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -52,6 +66,25 @@ class ModelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((state, pending), ("unloading", True))
         await manager.task
         self.assertEqual(manager.state, "unloaded")
+
+    async def test_cpu_identity_is_reused_and_reported_after_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = StackConfig(root / "asr.gguf", root / "diar.gguf", root / "campp.onnx", root / "speakers", identity_enabled=True)
+            embeddings = []
+            def embedding_factory(*_args, **_kwargs):
+                embeddings.append(FakeEmbedding())
+                return embeddings[-1]
+            manager = ModelManager(config, asr_factory=lambda *_args, **_kwargs: FakeBackend(), embedding_factory=embedding_factory)
+            with patch("gateway.manager.verify_artifact"):
+                await manager.request_load(); await manager.task
+                resident = manager.embedding
+                await manager.request_unload(); await manager.task
+                await manager.request_load(); await manager.task
+            self.assertIs(manager.embedding, resident)
+            self.assertEqual(len(embeddings), 1)
+            self.assertEqual(manager.components["identity"]["status"], "ready")
+            await manager.shutdown()
 
 
 if __name__ == "__main__":
