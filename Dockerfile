@@ -20,6 +20,7 @@ RUN cmake -S /src/transcribe.cpp -B /build/transcribe -GNinja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/opt/transcribe \
       -DCMAKE_CUDA_ARCHITECTURES="86;89" \
+      -DTRANSCRIBE_X86_CONSERVATIVE=ON \
       -DTRANSCRIBE_BUILD_SHARED=ON \
       -DTRANSCRIBE_CUDA=ON \
       -DTRANSCRIBE_BUILD_TESTS=OFF \
