@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -21,6 +22,27 @@ class SpeakerStoreTests(unittest.TestCase):
             self.assertEqual(store.get("alice-1").embedding.shape, (512,))
             with self.assertRaises(FileExistsError):
                 store.create("alice-1", None, [np.ones(512)])
+
+    def test_existing_private_writable_mount_allows_denied_chmod(self):
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            with patch("gateway.speakers.os.chmod", side_effect=PermissionError("mounted volume")) as chmod:
+                store = SpeakerStore(directory)
+            chmod.assert_called_once_with(store.directory, 0o700)
+            self.assertEqual(store.directory, Path(directory))
+
+    def test_nonprivate_or_unwritable_mount_has_explicit_ownership_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o755)
+            with patch("gateway.speakers.os.chmod", side_effect=PermissionError("mounted volume")):
+                with self.assertRaisesRegex(RuntimeError, r"speaker store .*not writable by uid .*fix volume ownership to"):
+                    SpeakerStore(directory)
+
+    def test_unreadable_or_unwritable_mount_has_explicit_ownership_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("gateway.speakers.os.chmod", side_effect=PermissionError("mounted volume")), patch("gateway.speakers.os.access", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, r"speaker store .*not writable by uid .*fix volume ownership to"):
+                    SpeakerStore(directory)
 
     def test_corrupt_and_incompatible_records_are_listed_not_matched(self):
         with tempfile.TemporaryDirectory() as directory:

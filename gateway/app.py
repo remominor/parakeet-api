@@ -389,8 +389,14 @@ async def stats(authorization: str | None = Header(None), x_api_key: str | None 
 
 @app.get("/info")
 async def info(request: Request, authorization: str | None = Header(None), x_api_key: str | None = Header(None, alias="X-API-Key")):
-    auth(authorization, x_api_key); native = getattr(request.app.state.model.asr, "native_identity", {}) if request.app.state.model.asr else {}
-    return {"service": "parakeet-api", "version": VERSION, "model": request.app.state.model.model_id, "engine": "transcribe.cpp", "engine_version": TRANSCRIBE_CPP_VERSION, "engine_commit": TRANSCRIBE_CPP_COMMIT, "native": native, "language": ["en"], "uptime_seconds": round(time.monotonic() - request.app.state.started, 1), "confidence_semantics": "minimum native entropy-based token confidence per word", "capabilities": {"word_timestamps": True, "word_confidence": True, "segments": True, "srt": True, "vtt": True, "diarization": STACK_CONFIG.diarization_enabled, "diarization_max_speakers": 4, "speaker_enrollment": STACK_CONFIG.identity_enabled, "speaker_identification": STACK_CONFIG.identity_enabled, "websocket_turn_endpointing": True, "realtime_transcription": True, "stateful_websocket_diarization": False, "partial_transcription": False, "translation": False, "prompt": False, "temperature_sampling": False}, "limits": {"max_upload_mb": SETTINGS.limit // 1048576, "websocket_max_frame_bytes": SETTINGS.ws_max_frame_bytes, "websocket_max_utterance_ms": SETTINGS.ws_max_utterance_ms, "websocket_completed_turn_queue": 2}}
+    auth(authorization, x_api_key)
+    manager = request.app.state.model
+    native = getattr(manager.asr, "native_identity", {}) if manager.asr else {}
+    identity_ready = (
+        getattr(manager, "identity", None) is not None
+        and getattr(manager, "components", {}).get("identity", {}).get("status") == "ready"
+    )
+    return {"service": "parakeet-api", "version": VERSION, "model": manager.model_id, "engine": "transcribe.cpp", "engine_version": TRANSCRIBE_CPP_VERSION, "engine_commit": TRANSCRIBE_CPP_COMMIT, "native": native, "language": ["en"], "uptime_seconds": round(time.monotonic() - request.app.state.started, 1), "confidence_semantics": "minimum native entropy-based token confidence per word", "capabilities": {"word_timestamps": True, "word_confidence": True, "segments": True, "srt": True, "vtt": True, "diarization": STACK_CONFIG.diarization_enabled, "diarization_max_speakers": 4, "speaker_enrollment": identity_ready, "speaker_identification": identity_ready, "websocket_turn_endpointing": True, "realtime_transcription": True, "stateful_websocket_diarization": False, "partial_transcription": False, "translation": False, "prompt": False, "temperature_sampling": False}, "limits": {"max_upload_mb": SETTINGS.limit // 1048576, "websocket_max_frame_bytes": SETTINGS.ws_max_frame_bytes, "websocket_max_utterance_ms": SETTINGS.ws_max_utterance_ms, "websocket_completed_turn_queue": 2}}
 
 
 @app.get("/metrics")

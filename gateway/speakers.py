@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -120,8 +121,35 @@ class SpeakerRecord:
 class SpeakerStore:
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.directory, 0o700)
+        uid, gid = os.geteuid(), os.getegid()
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            raise RuntimeError(
+                f"speaker store {self.directory} is not writable by uid {uid}; "
+                f"fix volume ownership to {uid}:{gid}"
+            ) from exc
+
+        # A Docker/Unraid mount may replace the image's pre-owned directory.
+        # chmod can then fail even when an ACL already grants this process
+        # private, writable access, so validate the actual mount before failing.
+        try:
+            os.chmod(self.directory, 0o700)
+        except OSError:
+            pass
+        try:
+            mode = stat.S_IMODE(self.directory.stat().st_mode)
+            writable = os.access(self.directory, os.R_OK | os.W_OK | os.X_OK)
+        except OSError as exc:
+            raise RuntimeError(
+                f"speaker store {self.directory} is not writable by uid {uid}; "
+                f"fix volume ownership to {uid}:{gid}"
+            ) from exc
+        if not writable or mode & 0o077:
+            raise RuntimeError(
+                f"speaker store {self.directory} is not writable by uid {uid} or private enough "
+                f"(requires mode 0700); fix volume ownership to {uid}:{gid}"
+            )
 
     def _path(self, speaker_id: str) -> Path:
         if not SPEAKER_ID_RE.fullmatch(speaker_id):

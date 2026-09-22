@@ -99,7 +99,10 @@ speaker.
 Templates are atomic mode-`0600` JSON records in `/data/speakers`; the
 directory is mode `0700`. Public APIs never return an embedding. Corrupt or
 model-incompatible records are listed as incompatible and excluded from
-matching. Enrollment never overwrites an ID.
+matching. Enrollment never overwrites an ID. For Docker/Unraid bind mounts,
+the mounted speaker-store root must be writable by the container user
+`10001:10001` and private (mode `0700`); the service emits an explicit startup
+error when the mount does not meet those requirements.
 
 Threshold and ambiguity margin are unset by default. Enrollment and embedding
 remain available, but matching returns `calibration_required`; full-context

@@ -157,6 +157,18 @@ class ModelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diarizer.closed, 1); self.assertEqual(manager.components["diarization"]["status"], "degraded")
         await manager.shutdown()
 
+    async def test_unusable_speaker_store_degrades_identity_without_blocking_asr(self):
+        asr, embedding = ControlledBackend(), FakeEmbedding()
+        manager = ModelManager(config(self.root, identity=True), asr_factory=lambda *_a, **_k: asr, embedding_factory=lambda *_a, **_k: embedding)
+        with patch("gateway.manager.SpeakerStore", side_effect=RuntimeError("speaker store /data/speakers is not writable by uid 10001; fix volume ownership to 10001:10001")):
+            await manager.request_load(); await manager.load_task
+        self.assertEqual(manager.state, "loaded")
+        self.assertIs(manager.asr, asr)
+        self.assertIsNone(manager.identity)
+        self.assertEqual(manager.components["identity"]["status"], "degraded")
+        self.assertEqual(embedding.closed, 1)
+        await manager.shutdown()
+
     async def test_cpu_identity_is_reused_and_reported_after_reload(self):
         embeddings = []
         def embedding_factory(*_args, **_kwargs): embeddings.append(FakeEmbedding()); return embeddings[-1]

@@ -119,6 +119,17 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], 401)
         self.assertIsInstance(response.json()["error"]["message"], str)
 
+    def test_info_hides_identity_capabilities_when_component_is_degraded(self):
+        manager = self.client.app.state.model
+        manager.identity = object()
+        manager.components = {"identity": {"status": "degraded", "required": False}}
+        with patch.object(self.module, "STACK_CONFIG", dataclasses.replace(self.module.STACK_CONFIG, identity_enabled=True)):
+            response = self.client.get("/info")
+        self.assertEqual(response.status_code, 200)
+        capabilities = response.json()["capabilities"]
+        self.assertFalse(capabilities["speaker_enrollment"])
+        self.assertFalse(capabilities["speaker_identification"])
+
     def test_enrichment_failure_fails_open(self):
         response = self.client.post("/v1/audio/transcriptions", files={"file": ("a.wav", self.audio, "audio/wav")}, data={"speech_context": "diarization"})
         self.assertEqual(response.status_code, 200)

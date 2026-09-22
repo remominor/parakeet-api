@@ -239,6 +239,7 @@ class ModelManager:
                 except Exception as exc:
                     if new_embedding:
                         await self._close(embedding); embedding = None; identity = None; new_embedding = False
+                    LOG.error("identity component degraded at startup: %s", exc)
                     components["identity"] = {"status": "degraded", "required": False, "device": "cpu", "error": str(exc), "vram_mb": 0}
 
             committed = False
