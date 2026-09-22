@@ -200,15 +200,18 @@ index 3544e9e8..7bc1da36 100644
      const int ed       = chp.enc_d_model;
      const int n_spk    = hp.max_speakers;
      const int sub      = hp.enc_subsampling_factor;
-@@ -820,7 +821,11 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
+@@ -820,7 +821,14 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
      if (sub <= 0 || P.chunk_len <= 0 || sched == nullptr || mel_buf == nullptr) {
          return TRANSCRIBE_ERR_INVALID_ARG;
      }
 -    sc.stream.reset(ed);
-+    if (preserve_state) {
-+        sc.stream.reset_run_output();
-+    } else {
++    // A newly created Session has no silence profile yet.  PRESERVE means
++    // preserve an already initialized bounded stream, never use empty AOSC
++    // state on its first turn.
++    if (!preserve_state || sc.stream.mean_sil_emb.size() != static_cast<size_t>(ed)) {
 +        sc.stream.reset(ed);
++    } else {
++        sc.stream.reset_run_output();
 +    }
  
      const bool external_cadence = P.feat_first_chunk > 0;

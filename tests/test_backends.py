@@ -108,6 +108,16 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await backend.expire_speaker_sessions()
         self.assertEqual(state.native_session.closed, 1)
 
+    async def test_stale_identity_observation_cannot_overwrite_newer_binding(self):
+        backend = object.__new__(TranscribeCppDiarizer)
+        backend._lock = asyncio.Lock(); backend._model = FakeDiarModel(); backend._threads = 0
+        backend._session_ttl_seconds = 3600; backend._session_max = 2; backend._speaker_sessions = {}
+        await backend._get_stateful_session_locked("home")
+        newer = await backend.apply_identity_bindings("home", {"speaker_0": {"status": "known", "speaker_id": "wife"}}, generation=2)
+        stale = await backend.apply_identity_bindings("home", {"speaker_0": {"status": "known", "speaker_id": "remo"}}, generation=1)
+        self.assertEqual(newer["speaker_0"]["speaker_id"], "wife")
+        self.assertEqual(stale["speaker_0"]["speaker_id"], "wife")
+
     async def test_close_releases_all_persistent_sessions(self):
         backend = object.__new__(TranscribeCppDiarizer)
         backend._lock = asyncio.Lock(); backend._model = FakeDiarModel(); backend._threads = 0

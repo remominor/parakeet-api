@@ -397,7 +397,11 @@ async def info(request: Request, authorization: str | None = Header(None), x_api
         getattr(manager, "identity", None) is not None
         and getattr(manager, "components", {}).get("identity", {}).get("status") == "ready"
     )
-    return {"service": "parakeet-api", "version": VERSION, "model": manager.model_id, "engine": "transcribe.cpp", "engine_version": TRANSCRIBE_CPP_VERSION, "engine_commit": TRANSCRIBE_CPP_COMMIT, "native": native, "language": ["en"], "uptime_seconds": round(time.monotonic() - request.app.state.started, 1), "confidence_semantics": "minimum native entropy-based token confidence per word", "capabilities": {"word_timestamps": True, "word_confidence": True, "segments": True, "srt": True, "vtt": True, "diarization": STACK_CONFIG.diarization_enabled, "diarization_max_speakers": 4, "speaker_enrollment": identity_ready, "speaker_identification": identity_ready, "stateful_diarization_sessions": STACK_CONFIG.diarization_enabled, "websocket_turn_endpointing": True, "realtime_transcription": True, "stateful_websocket_diarization": False, "partial_transcription": False, "translation": False, "prompt": False, "temperature_sampling": False}, "limits": {"max_upload_mb": SETTINGS.limit // 1048576, "websocket_max_frame_bytes": SETTINGS.ws_max_frame_bytes, "websocket_max_utterance_ms": SETTINGS.ws_max_utterance_ms, "websocket_completed_turn_queue": 2, "speaker_session_ttl_seconds": STACK_CONFIG.speaker_session_ttl_seconds, "speaker_session_max": STACK_CONFIG.speaker_session_max}}
+    diarization_ready = (
+        getattr(manager, "diarizer", None) is not None
+        and getattr(manager, "components", {}).get("diarization", {}).get("status") == "ready"
+    )
+    return {"service": "parakeet-api", "version": VERSION, "model": manager.model_id, "engine": "transcribe.cpp", "engine_version": TRANSCRIBE_CPP_VERSION, "engine_commit": TRANSCRIBE_CPP_COMMIT, "native": native, "language": ["en"], "uptime_seconds": round(time.monotonic() - request.app.state.started, 1), "confidence_semantics": "minimum native entropy-based token confidence per word", "capabilities": {"word_timestamps": True, "word_confidence": True, "segments": True, "srt": True, "vtt": True, "diarization": diarization_ready, "diarization_max_speakers": 4, "speaker_enrollment": identity_ready, "speaker_identification": identity_ready, "stateful_diarization_sessions": diarization_ready, "websocket_turn_endpointing": True, "realtime_transcription": True, "stateful_websocket_diarization": False, "partial_transcription": False, "translation": False, "prompt": False, "temperature_sampling": False}, "limits": {"max_upload_mb": SETTINGS.limit // 1048576, "websocket_max_frame_bytes": SETTINGS.ws_max_frame_bytes, "websocket_max_utterance_ms": SETTINGS.ws_max_utterance_ms, "websocket_completed_turn_queue": 2, "speaker_session_ttl_seconds": STACK_CONFIG.speaker_session_ttl_seconds, "speaker_session_max": STACK_CONFIG.speaker_session_max}}
 
 
 @app.get("/metrics")
@@ -459,7 +463,8 @@ async def diarize_audio(manager: ModelManager, decoded: DecodedAudio, *, identif
     bindings: dict[str, dict] = {}
     if session_id is not None:
         apply = getattr(manager.diarizer, "apply_identity_bindings", None)
-        if identify and callable(apply): bindings = await apply(session_id, identities)
+        generation = diarization[0].session_generation if diarization else None
+        if identify and callable(apply): bindings = await apply(session_id, identities, generation)
         else:
             get_bindings = getattr(manager.diarizer, "get_identity_bindings", None)
             if callable(get_bindings): bindings = await get_bindings(session_id)

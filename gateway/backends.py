@@ -42,6 +42,8 @@ class SpeakerSegment:
     identity: dict | None = None
     speaker_slot: str | None = None
     native_speaker_id: int | None = None
+    # Internal per-session ordering token; deliberately not serialized.
+    session_generation: int | None = None
 
     def as_dict(self) -> dict:
         out = {"start": self.start, "end": self.end, "speaker": self.speaker, "confidence": self.confidence}
@@ -202,6 +204,8 @@ class StatefulSpeakerSession:
     created_at: float
     last_used_at: float
     identity_bindings: dict[str, dict] = field(default_factory=dict)
+    turn_generation: int = 0
+    last_binding_generation: int = 0
 
 
 class TranscribeCppDiarizer:
@@ -282,6 +286,7 @@ class TranscribeCppDiarizer:
                 native_session, options = self._session, self._options
             else:
                 state = await self._get_stateful_session_locked(session_id)
+                state.turn_generation += 1
                 native_session, options = state.native_session, self._stateful_options
             result = await asyncio.to_thread(native_session.run, pcm, timestamps="auto", family=options)
         output: list[SpeakerSegment] = []
@@ -299,11 +304,12 @@ class TranscribeCppDiarizer:
                     probability if math.isfinite(probability) else None,
                     speaker_slot=slot,
                     native_speaker_id=native_id,
+                    session_generation=state.turn_generation if session_id is not None else None,
                 )
             )
         return output
 
-    async def apply_identity_bindings(self, session_id: str, observations: dict[str, dict]) -> dict[str, dict]:
+    async def apply_identity_bindings(self, session_id: str, observations: dict[str, dict], generation: int | None = None) -> dict[str, dict]:
         """Apply only authoritative CAM++ observations and return bindings.
 
         A known result replaces the slot's current identity and moves that
@@ -315,6 +321,12 @@ class TranscribeCppDiarizer:
             if state is None:
                 return {}
             state.last_used_at = time.monotonic()
+            # CAM++ intentionally runs after native diarization.  Concurrent
+            # requests can therefore finish identity inference out of order;
+            # never let an older observation overwrite a newer binding.
+            if generation is not None and generation < state.last_binding_generation:
+                return {slot: dict(binding) for slot, binding in state.identity_bindings.items()}
+            changed = False
             for slot, observation in observations.items():
                 if observation.get("status") != "known" or not observation.get("speaker_id"):
                     continue
@@ -323,6 +335,9 @@ class TranscribeCppDiarizer:
                     if bound_slot != slot and binding.get("speaker_id") == speaker_id:
                         del state.identity_bindings[bound_slot]
                 state.identity_bindings[slot] = dict(observation)
+                changed = True
+            if changed and generation is not None:
+                state.last_binding_generation = max(state.last_binding_generation, generation)
             return {slot: dict(binding) for slot, binding in state.identity_bindings.items()}
 
     async def get_identity_bindings(self, session_id: str) -> dict[str, dict]:

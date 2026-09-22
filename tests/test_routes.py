@@ -32,7 +32,7 @@ class SessionDiarizer:
     async def diarize(self, _pcm, session_id=None):
         self.sessions.setdefault(session_id, 0); self.sessions[session_id] += 1
         return [SpeakerSegment(0, 1, "speaker_1", speaker_slot="speaker_1", native_speaker_id=2)]
-    async def apply_identity_bindings(self, session_id, observations):
+    async def apply_identity_bindings(self, session_id, observations, _generation=None):
         bindings = self.sessions.setdefault(("bindings", session_id), {})
         for slot, value in observations.items():
             if value.get("status") == "known": bindings[slot] = dict(value)
@@ -143,6 +143,17 @@ class RouteTests(unittest.TestCase):
         capabilities = response.json()["capabilities"]
         self.assertFalse(capabilities["speaker_enrollment"])
         self.assertFalse(capabilities["speaker_identification"])
+
+    def test_info_hides_diarization_session_capabilities_when_component_is_degraded(self):
+        manager = self.client.app.state.model
+        manager.diarizer = object()
+        manager.components = {"diarization": {"status": "degraded", "required": False}}
+        with patch.object(self.module, "STACK_CONFIG", dataclasses.replace(self.module.STACK_CONFIG, diarization_enabled=True)):
+            response = self.client.get("/info")
+        self.assertEqual(response.status_code, 200)
+        capabilities = response.json()["capabilities"]
+        self.assertFalse(capabilities["diarization"])
+        self.assertFalse(capabilities["stateful_diarization_sessions"])
 
     def test_enrichment_failure_fails_open(self):
         response = self.client.post("/v1/audio/transcriptions", files={"file": ("a.wav", self.audio, "audio/wav")}, data={"speech_context": "diarization"})
