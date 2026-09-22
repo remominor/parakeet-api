@@ -53,6 +53,8 @@ class StackConfig:
     identity_threshold: float | None = None
     identity_margin: float | None = None
     identity_minimum_audio: float = 1.5
+    speaker_session_ttl_seconds: float = 3600
+    speaker_session_max: int = 16
 
     @property
     def model_id(self) -> str:
@@ -86,6 +88,8 @@ class StackConfig:
             identity_threshold=env_optional_float("PARAKEET_IDENTITY_THRESHOLD"),
             identity_margin=env_optional_float("PARAKEET_IDENTITY_MARGIN"),
             identity_minimum_audio=float(os.getenv("PARAKEET_IDENTITY_MINIMUM_AUDIO_MS", "1500")) / 1000,
+            speaker_session_ttl_seconds=float(os.getenv("PARAKEET_SPEAKER_SESSION_TTL_SECONDS", "3600")),
+            speaker_session_max=int(os.getenv("PARAKEET_SPEAKER_SESSION_MAX", "16")),
         )
 
 
@@ -205,6 +209,8 @@ class ModelManager:
                         self.config.diarization_model,
                         device_selector=self.config.diarization_device,
                         threads=self.config.native_threads,
+                        session_ttl_seconds=self.config.speaker_session_ttl_seconds,
+                        session_max=self.config.speaker_session_max,
                     )
                     if hasattr(diarizer, "warm"):
                         await diarizer.warm()
@@ -353,6 +359,7 @@ class ModelManager:
             "vram_reserved_mb": used,
             "gpu_memory": telemetry["gpu_memory"],
             "gpu_memory_scope": "process_total",
+            "speaker_sessions_active": getattr(self.diarizer, "speaker_sessions_active", 0) if self.diarizer else 0,
         }
         if self.components:
             body["components"] = self.components

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -17,6 +18,7 @@ class Word:
     end: float
     confidence: float | None = None
     speaker: str | None = None
+    speaker_slot: str | None = None
 
     def as_dict(self) -> dict:
         out = {"word": self.word, "start": self.start, "end": self.end}
@@ -26,6 +28,8 @@ class Word:
             out["confidence"] = self.confidence
         if self.speaker is not None:
             out["speaker"] = self.speaker
+        if self.speaker_slot is not None:
+            out["speaker_slot"] = self.speaker_slot
         return out
 
 
@@ -36,11 +40,17 @@ class SpeakerSegment:
     speaker: str
     confidence: float | None = None
     identity: dict | None = None
+    speaker_slot: str | None = None
+    native_speaker_id: int | None = None
 
     def as_dict(self) -> dict:
         out = {"start": self.start, "end": self.end, "speaker": self.speaker, "confidence": self.confidence}
         if self.identity is not None:
             out["identity"] = self.identity
+        if self.speaker_slot is not None:
+            out["speaker_slot"] = self.speaker_slot
+        if self.native_speaker_id is not None:
+            out["native_speaker_id"] = self.native_speaker_id
         return out
 
 
@@ -71,7 +81,7 @@ class ASRBackend(Protocol):
 class DiarizationBackend(Protocol):
     device: str | None
 
-    async def diarize(self, pcm: np.ndarray) -> list[SpeakerSegment]: ...
+    async def diarize(self, pcm: np.ndarray, session_id: str | None = None) -> list[SpeakerSegment]: ...
     async def close(self) -> None: ...
 
 
@@ -179,8 +189,31 @@ class TranscribeCppASR:
         await asyncio.to_thread(self._model.close)
 
 
+@dataclass
+class StatefulSpeakerSession:
+    """Bounded, in-memory Sortformer state for one logical speaker session.
+
+    This holds native AOSC/FIFO state and semantic bindings only.  It never
+    stores PCM, transcripts, or prior result segments.
+    """
+
+    session_id: str
+    native_session: object
+    created_at: float
+    last_used_at: float
+    identity_bindings: dict[str, dict] = field(default_factory=dict)
+
+
 class TranscribeCppDiarizer:
-    def __init__(self, path: str | Path, *, device_selector: str | None = None, threads: int = 0):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        device_selector: str | None = None,
+        threads: int = 0,
+        session_ttl_seconds: float = 3600,
+        session_max: int = 16,
+    ):
         import transcribe_cpp
 
         self._module = transcribe_cpp
@@ -192,33 +225,134 @@ class TranscribeCppDiarizer:
         self.device = native_device.device_id or native_device.name or native_device.kind
         self.device_description = device_description(native_device)
         self._options = transcribe_cpp.SortformerStreamOptions(preset="very_high_latency")
+        self._stateful_options = transcribe_cpp.SortformerStreamOptions(
+            preset="very_high_latency", preserve_state=True
+        )
+        self._threads = threads
+        self._session_ttl_seconds = max(0.0, float(session_ttl_seconds))
+        self._session_max = max(1, int(session_max))
+        self._speaker_sessions: dict[str, StatefulSpeakerSession] = {}
         self._lock = asyncio.Lock()
 
-    async def diarize(self, pcm: np.ndarray) -> list[SpeakerSegment]:
+    @property
+    def speaker_sessions_active(self) -> int:
+        return len(self._speaker_sessions)
+
+    async def _close_native_session(self, session: object) -> None:
+        await asyncio.to_thread(session.close)
+
+    async def _expire_sessions_locked(self, now: float) -> None:
+        if self._session_ttl_seconds <= 0:
+            expired = list(self._speaker_sessions.values())
+            self._speaker_sessions.clear()
+        else:
+            expired = [
+                value for value in self._speaker_sessions.values()
+                if now - value.last_used_at >= self._session_ttl_seconds
+            ]
+            for value in expired:
+                self._speaker_sessions.pop(value.session_id, None)
+        for value in expired:
+            await self._close_native_session(value.native_session)
+
+    async def _get_stateful_session_locked(self, session_id: str) -> StatefulSpeakerSession:
+        now = time.monotonic()
+        await self._expire_sessions_locked(now)
+        current = self._speaker_sessions.get(session_id)
+        if current is not None:
+            current.last_used_at = now
+            return current
+        if len(self._speaker_sessions) >= self._session_max:
+            # Deterministic LRU eviction keeps the registry bounded even when
+            # callers create many session IDs.
+            oldest = min(self._speaker_sessions.values(), key=lambda value: value.last_used_at)
+            self._speaker_sessions.pop(oldest.session_id, None)
+            await self._close_native_session(oldest.native_session)
+        native_session = await asyncio.to_thread(self._model.session, n_threads=self._threads)
+        current = StatefulSpeakerSession(session_id, native_session, now, now)
+        self._speaker_sessions[session_id] = current
+        return current
+
+    async def diarize(self, pcm: np.ndarray, session_id: str | None = None) -> list[SpeakerSegment]:
         async with self._lock:
             # Sortformer has no transcript timestamp axis; AUTO resolves to its
             # speaker-segment output while explicit text segment timestamps are
             # correctly rejected by the native API.
-            result = await asyncio.to_thread(self._session.run, pcm, timestamps="auto", family=self._options)
-        labels: dict[int, str] = {}
+            if session_id is None:
+                native_session, options = self._session, self._options
+            else:
+                state = await self._get_stateful_session_locked(session_id)
+                native_session, options = state.native_session, self._stateful_options
+            result = await asyncio.to_thread(native_session.run, pcm, timestamps="auto", family=options)
         output: list[SpeakerSegment] = []
         for segment in sorted(result.speaker_segments, key=lambda value: (value.t0_ms, value.t1_ms)):
-            if segment.speaker_id not in labels:
-                labels[segment.speaker_id] = f"speaker_{len(labels)}"
+            native_id = int(segment.speaker_id)
+            # Sortformer slots are one-based.  Preserve them directly rather
+            # than renumbering speakers by first arrival in each request.
+            slot = f"speaker_{native_id - 1}"
             probability = float(segment.p)
             output.append(
                 SpeakerSegment(
                     segment.t0_ms / 1000,
                     segment.t1_ms / 1000,
-                    labels[segment.speaker_id],
+                    slot,
                     probability if math.isfinite(probability) else None,
+                    speaker_slot=slot,
+                    native_speaker_id=native_id,
                 )
             )
         return output
+
+    async def apply_identity_bindings(self, session_id: str, observations: dict[str, dict]) -> dict[str, dict]:
+        """Apply only authoritative CAM++ observations and return bindings.
+
+        A known result replaces the slot's current identity and moves that
+        identity from any other slot.  All non-known outcomes intentionally
+        leave established session identity untouched.
+        """
+        async with self._lock:
+            state = self._speaker_sessions.get(session_id)
+            if state is None:
+                return {}
+            state.last_used_at = time.monotonic()
+            for slot, observation in observations.items():
+                if observation.get("status") != "known" or not observation.get("speaker_id"):
+                    continue
+                speaker_id = observation["speaker_id"]
+                for bound_slot, binding in list(state.identity_bindings.items()):
+                    if bound_slot != slot and binding.get("speaker_id") == speaker_id:
+                        del state.identity_bindings[bound_slot]
+                state.identity_bindings[slot] = dict(observation)
+            return {slot: dict(binding) for slot, binding in state.identity_bindings.items()}
+
+    async def get_identity_bindings(self, session_id: str) -> dict[str, dict]:
+        async with self._lock:
+            state = self._speaker_sessions.get(session_id)
+            if state is None:
+                return {}
+            state.last_used_at = time.monotonic()
+            return {slot: dict(binding) for slot, binding in state.identity_bindings.items()}
+
+    async def reset_speaker_session(self, session_id: str) -> bool:
+        async with self._lock:
+            state = self._speaker_sessions.pop(session_id, None)
+            if state is None:
+                return False
+            await self._close_native_session(state.native_session)
+            return True
+
+    async def expire_speaker_sessions(self) -> None:
+        async with self._lock:
+            await self._expire_sessions_locked(time.monotonic())
 
     async def warm(self) -> None:
         await self.diarize(np.zeros(8_000, dtype=np.float32))
 
     async def close(self) -> None:
+        async with self._lock:
+            stateful = list(self._speaker_sessions.values())
+            self._speaker_sessions.clear()
+        for state in stateful:
+            await self._close_native_session(state.native_session)
         await asyncio.to_thread(self._session.close)
         await asyncio.to_thread(self._model.close)

@@ -27,6 +27,20 @@ class FakeDiarizer:
         return [SpeakerSegment(0, 1, "speaker_0")]
 
 
+class SessionDiarizer:
+    def __init__(self): self.sessions = {}; self.reset_calls = []
+    async def diarize(self, _pcm, session_id=None):
+        self.sessions.setdefault(session_id, 0); self.sessions[session_id] += 1
+        return [SpeakerSegment(0, 1, "speaker_1", speaker_slot="speaker_1", native_speaker_id=2)]
+    async def apply_identity_bindings(self, session_id, observations):
+        bindings = self.sessions.setdefault(("bindings", session_id), {})
+        for slot, value in observations.items():
+            if value.get("status") == "known": bindings[slot] = dict(value)
+        return dict(bindings)
+    async def get_identity_bindings(self, session_id): return dict(self.sessions.get(("bindings", session_id), {}))
+    async def reset_speaker_session(self, session_id): self.reset_calls.append(session_id); return True
+
+
 class FakeEmbedding:
     async def embed(self, _pcm):
         return np.ones(512, dtype=np.float32) / np.sqrt(512)
@@ -99,7 +113,7 @@ class RouteTests(unittest.TestCase):
         with patch.object(self.module, "SETTINGS", dataclasses.replace(self.module.SETTINGS, webui_enabled=True)):
             response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        for marker in ("speech_context", "/v1/speakers/enroll", "/v1/speakers/verify", "Record enrollment sample", "Raw speech context", "sessionStorage", "candidate_score", "stream?.getTracks()"):
+        for marker in ("speech_context", "speaker_session_id", "Reset session", "/v1/audio/diarization-sessions/", "/v1/speakers/enroll", "/v1/speakers/verify", "Record enrollment sample", "Raw speech context", "sessionStorage", "candidate_score", "stream?.getTracks()"):
             self.assertIn(marker, response.text)
 
     def test_metrics_exposes_exact_queue_gauge(self):
@@ -150,6 +164,28 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["segments"][0]["speaker"], "speaker_0")
         self.assertEqual(response.json()["statistics"]["dominant_speaker"], "speaker_0")
+
+    def test_session_id_validation_and_idempotent_reset(self):
+        self.client.app.state.model.diarizer = SessionDiarizer()
+        invalid = self.client.post("/v1/audio/diarizations", files={"file": ("a.wav", self.audio, "audio/wav")}, data={"speaker_session_id": "has space"})
+        self.assertEqual(invalid.status_code, 422)
+        response = self.client.post("/v1/audio/diarizations", files={"file": ("a.wav", self.audio, "audio/wav")}, data={"speaker_session_id": "household-main"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["segments"][0]["speaker_slot"], "speaker_1")
+        reset = self.client.delete("/v1/audio/diarization-sessions/household-main")
+        self.assertEqual(reset.status_code, 204)
+        self.assertEqual(self.client.app.state.model.diarizer.reset_calls, ["household-main"])
+
+    def test_session_binding_is_public_but_slot_remains_available(self):
+        diarizer = SessionDiarizer(); self.client.app.state.model.diarizer = diarizer
+        self.client.app.state.model.identity = SimpleNamespace(identify=lambda *_args: None)
+        # Direct helper isolates semantic display policy from model implementation.
+        segment = SpeakerSegment(0, 1, "speaker_1", speaker_slot="speaker_1", native_speaker_id=2)
+        status, labels = self.module._semantic_diarization_response([segment], {"speaker_1": {"status": "unknown"}}, {"speaker_1": {"status": "known", "speaker_id": "remo", "display_name": "Remo", "score": .8}}, True)
+        self.assertEqual(segment.speaker, "remo")
+        self.assertEqual(segment.speaker_slot, "speaker_1")
+        self.assertEqual(status["remo"]["status"], "known")
+        self.assertEqual(labels["speaker_1"], "remo")
 
     def test_identity_failure_fails_open_with_component_degraded(self):
         self.client.app.state.model.diarizer = FakeDiarizer()

@@ -40,6 +40,7 @@ TRANSCRIBE_CPP_VERSION = "0.2.3"
 TRANSCRIBE_CPP_COMMIT = "63a44d9239d610b3908e8a66b384924cd4a77217"
 FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
 SPEECH_CONTEXTS = {"none", "diarization", "full"}
+SPEAKER_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 RID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 SENTENCE_RE = re.compile(r"[.?!][\"')\]]*$")
 STACK_CONFIG = StackConfig.load()
@@ -396,7 +397,7 @@ async def info(request: Request, authorization: str | None = Header(None), x_api
         getattr(manager, "identity", None) is not None
         and getattr(manager, "components", {}).get("identity", {}).get("status") == "ready"
     )
-    return {"service": "parakeet-api", "version": VERSION, "model": manager.model_id, "engine": "transcribe.cpp", "engine_version": TRANSCRIBE_CPP_VERSION, "engine_commit": TRANSCRIBE_CPP_COMMIT, "native": native, "language": ["en"], "uptime_seconds": round(time.monotonic() - request.app.state.started, 1), "confidence_semantics": "minimum native entropy-based token confidence per word", "capabilities": {"word_timestamps": True, "word_confidence": True, "segments": True, "srt": True, "vtt": True, "diarization": STACK_CONFIG.diarization_enabled, "diarization_max_speakers": 4, "speaker_enrollment": identity_ready, "speaker_identification": identity_ready, "websocket_turn_endpointing": True, "realtime_transcription": True, "stateful_websocket_diarization": False, "partial_transcription": False, "translation": False, "prompt": False, "temperature_sampling": False}, "limits": {"max_upload_mb": SETTINGS.limit // 1048576, "websocket_max_frame_bytes": SETTINGS.ws_max_frame_bytes, "websocket_max_utterance_ms": SETTINGS.ws_max_utterance_ms, "websocket_completed_turn_queue": 2}}
+    return {"service": "parakeet-api", "version": VERSION, "model": manager.model_id, "engine": "transcribe.cpp", "engine_version": TRANSCRIBE_CPP_VERSION, "engine_commit": TRANSCRIBE_CPP_COMMIT, "native": native, "language": ["en"], "uptime_seconds": round(time.monotonic() - request.app.state.started, 1), "confidence_semantics": "minimum native entropy-based token confidence per word", "capabilities": {"word_timestamps": True, "word_confidence": True, "segments": True, "srt": True, "vtt": True, "diarization": STACK_CONFIG.diarization_enabled, "diarization_max_speakers": 4, "speaker_enrollment": identity_ready, "speaker_identification": identity_ready, "stateful_diarization_sessions": STACK_CONFIG.diarization_enabled, "websocket_turn_endpointing": True, "realtime_transcription": True, "stateful_websocket_diarization": False, "partial_transcription": False, "translation": False, "prompt": False, "temperature_sampling": False}, "limits": {"max_upload_mb": SETTINGS.limit // 1048576, "websocket_max_frame_bytes": SETTINGS.ws_max_frame_bytes, "websocket_max_utterance_ms": SETTINGS.ws_max_utterance_ms, "websocket_completed_turn_queue": 2, "speaker_session_ttl_seconds": STACK_CONFIG.speaker_session_ttl_seconds, "speaker_session_max": STACK_CONFIG.speaker_session_max}}
 
 
 @app.get("/metrics")
@@ -413,11 +414,36 @@ async def translations():
     raise HTTPException(501, "translation is not supported; use /v1/audio/transcriptions")
 
 
-async def diarize_audio(manager: ModelManager, decoded: DecodedAudio, *, identify: bool) -> dict:
+def _semantic_diarization_response(diarization: list[SpeakerSegment], observations: dict[str, dict], bindings: dict[str, dict], identify: bool) -> tuple[dict[str, dict], dict[str, str]]:
+    """Apply session semantic labels while preserving Sortformer slot metadata."""
+    status: dict[str, dict] = {}
+    labels: dict[str, str] = {}
+    for item in diarization:
+        slot = item.speaker_slot or item.speaker
+        binding = bindings.get(slot)
+        public = binding.get("speaker_id") if binding else slot
+        labels[slot] = public
+        item.speaker_slot = slot
+        item.speaker = public
+        item.identity = dict(binding or (observations.get(slot, {"status": "unavailable"}) if identify else {"status": "unavailable"}))
+        item.identity["speaker_slot"] = slot
+        status[public] = dict(item.identity)
+    return status, labels
+
+
+def _semantic_statistics(statistics: dict, labels: dict[str, str]) -> dict:
+    output = dict(statistics)
+    output["dominant_speaker"] = labels.get(statistics.get("dominant_speaker"), statistics.get("dominant_speaker"))
+    output["speaker_durations"] = {labels.get(name, name): value for name, value in statistics.get("speaker_durations", {}).items()}
+    return output
+
+
+async def diarize_audio(manager: ModelManager, decoded: DecodedAudio, *, identify: bool, session_id: str | None = None) -> dict:
     if manager.diarizer is None: raise HTTPException(503, "diarization_unavailable")
     STATS.diarization_total += 1; started = time.perf_counter()
     diarization_elapsed = 0.0; identity_elapsed = 0.0
-    try: diarization: list[SpeakerSegment] = await manager.diarizer.diarize(decoded.pcm)
+    try:
+        diarization: list[SpeakerSegment] = await manager.diarizer.diarize(decoded.pcm) if session_id is None else await manager.diarizer.diarize(decoded.pcm, session_id=session_id)
     except Exception as exc: STATS.diarization_failed += 1; raise HTTPException(502, f"diarization_failed: {exc.__class__.__name__}: {exc}") from exc
     finally: diarization_elapsed = (time.perf_counter() - started) * 1000; STATS.diarization_ms.append(diarization_elapsed)
     identities: dict[str, dict] = {}; identity_error = None; identity_component = "not_requested"
@@ -430,22 +456,37 @@ async def diarize_audio(manager: ModelManager, decoded: DecodedAudio, *, identif
             except Exception as exc:
                 identity_component = "degraded"; STATS.identity_failed += 1; identities = {speaker: {"status": "unavailable"} for speaker in dict.fromkeys(item.speaker for item in diarization)}; identity_error = {"component": "identity", "code": "inference_failed", "message": f"{exc.__class__.__name__}: {exc}"}
         identity_elapsed = (time.perf_counter() - identity_started) * 1000; STATS.identity_ms.append(identity_elapsed)
-        for item in diarization: item.identity = identities.get(item.speaker, {"status": "unavailable"})
-    body = {"segments": [item.as_dict() for item in diarization], "statistics": interval_statistics(diarization), "speaker_status": identities if identify else {speaker: {"status": "unavailable"} for speaker in dict.fromkeys(item.speaker for item in diarization)}, "components": {"diarization": "ready", "identity": identity_component}, "timings": {"diarization_ms": round(diarization_elapsed, 1), "identity_ms": round(identity_elapsed, 1)}}
+    bindings: dict[str, dict] = {}
+    if session_id is not None:
+        apply = getattr(manager.diarizer, "apply_identity_bindings", None)
+        if identify and callable(apply): bindings = await apply(session_id, identities)
+        else:
+            get_bindings = getattr(manager.diarizer, "get_identity_bindings", None)
+            if callable(get_bindings): bindings = await get_bindings(session_id)
+    raw_statistics = interval_statistics(diarization)
+    speaker_status, labels = _semantic_diarization_response(diarization, identities, bindings, identify)
+    body = {"segments": [item.as_dict() for item in diarization], "statistics": _semantic_statistics(raw_statistics, labels), "speaker_status": speaker_status, "components": {"diarization": "ready", "identity": identity_component}, "timings": {"diarization_ms": round(diarization_elapsed, 1), "identity_ms": round(identity_elapsed, 1)}}
+    if session_id is not None: body["speaker_session_id"] = session_id
     if identity_error: body["errors"] = [identity_error]
     return body
 
 
-async def add_speech_context(manager: ModelManager, result: dict, decoded: DecodedAudio, mode: str) -> None:
+async def add_speech_context(manager: ModelManager, result: dict, decoded: DecodedAudio, mode: str, session_id: str | None = None) -> None:
     started = time.perf_counter(); errors: list[dict] = []
     context: dict[str, Any] = {"requested": mode, "status": "complete", "segments": [], "speakers": [], "speaker_status": {}, "statistics": interval_statistics([]), "components": {"asr": "ready", "diarization": "unavailable", "identity": "not_requested"}, "timings": {"diarization_ms": 0.0, "identity_ms": 0.0}, "errors": errors}
+    if session_id is not None: context["speaker_session_id"] = session_id
     try:
-        detail = await diarize_audio(manager, decoded, identify=mode == "full")
-        diarization = [SpeakerSegment(item["start"], item["end"], item["speaker"], item.get("confidence"), item.get("identity")) for item in detail["segments"]]
+        detail = await diarize_audio(manager, decoded, identify=mode == "full", session_id=session_id)
+        diarization = [SpeakerSegment(item["start"], item["end"], item.get("speaker_slot", item["speaker"]), item.get("confidence"), speaker_slot=item.get("speaker_slot")) for item in detail["segments"]]
         from .backends import Word
         normalized = [Word(str(item.get("word", "")), float(item.get("start", 0)), float(item.get("end", 0)), item.get("confidence", item.get("conf"))) for item in result.get("words", [])]
         attribute_words(normalized, diarization)
-        for public, word in zip(result.get("words", []), normalized): public["speaker"] = word.speaker
+        labels = {item.get("speaker_slot", item["speaker"]): item["speaker"] for item in detail["segments"]}
+        for public, word in zip(result.get("words", []), normalized):
+            if word.speaker not in {None, "overlap", "unattributed"}:
+                public["speaker_slot"] = word.speaker
+                public["speaker"] = labels.get(word.speaker, word.speaker)
+            else: public["speaker"] = word.speaker
         context["segments"] = detail["segments"]; context["statistics"] = detail["statistics"]; context["speaker_status"] = detail["speaker_status"]; context["speakers"] = [{"speaker": speaker, **status} for speaker, status in detail["speaker_status"].items()]; context["components"].update(detail["components"]); context["timings"].update(detail["timings"]); errors.extend(detail.get("errors", []))
         if errors: context["status"] = "degraded"
     except HTTPException as exc:
@@ -457,12 +498,14 @@ async def add_speech_context(manager: ModelManager, result: dict, decoded: Decod
 
 
 @app.post("/v1/audio/transcriptions")
-async def transcribe(request: Request, file: UploadFile | None = File(None), audio_url: str | None = Form(None), model: str | None = Form(None), response_format: str = Form("json"), language: str | None = Form(None), prompt: str | None = Form(None), temperature: float | None = Form(None), timestamp_granularities: list[str] | None = Form(None, alias="timestamp_granularities[]"), speech_context: str | None = Form(None), authorization: str | None = Header(None), x_api_key: str | None = Header(None, alias="X-API-Key"), x_request_id: str | None = Header(None, alias="X-Request-ID")):
+async def transcribe(request: Request, file: UploadFile | None = File(None), audio_url: str | None = Form(None), model: str | None = Form(None), response_format: str = Form("json"), language: str | None = Form(None), prompt: str | None = Form(None), temperature: float | None = Form(None), timestamp_granularities: list[str] | None = Form(None, alias="timestamp_granularities[]"), speech_context: str | None = Form(None), speaker_session_id: str | None = Form(None), authorization: str | None = Header(None), x_api_key: str | None = Header(None, alias="X-API-Key"), x_request_id: str | None = Header(None, alias="X-Request-ID")):
     auth(authorization, x_api_key); valid_model(model); validate_options(language, prompt, temperature)
     if not await request.app.state.model.is_loaded(): raise HTTPException(503, "model_unavailable")
     output = (response_format or "json").lower(); context_mode = (speech_context or "none").lower()
     if output not in FORMATS: raise HTTPException(400, f"response_format must be one of {', '.join(sorted(FORMATS))}")
     if context_mode not in SPEECH_CONTEXTS: raise HTTPException(422, "speech_context must be none, diarization, or full")
+    if speaker_session_id and not SPEAKER_SESSION_ID_RE.fullmatch(speaker_session_id): raise HTTPException(422, "speaker_session_id must match [a-zA-Z0-9_-]{1,64}")
+    if speaker_session_id and context_mode == "none": raise HTTPException(422, "speaker_session_id requires diarization or full speech_context")
     if context_mode != "none" and output not in {"json", "verbose_json"}: raise HTTPException(422, "speech_context enrichment requires json or verbose_json")
     decoded = await get_audio(file, audio_url); STATS.requests_total += 1; STATS.requests_active += 1; started = time.perf_counter()
     granularities = list(timestamp_granularities or []); needs_words = output in {"verbose_json", "srt", "vtt"} or "word" in granularities or context_mode != "none"
@@ -471,7 +514,7 @@ async def transcribe(request: Request, file: UploadFile | None = File(None), aud
     try:
         async with request.app.state.model.admit():
             result, engine_ms = await engine_transcribe(request.app, decoded, form, parse_json=output != "text", admitted=True)
-            if context_mode != "none": assert isinstance(result, dict); await add_speech_context(request.app.state.model, result, decoded, context_mode)
+            if context_mode != "none": assert isinstance(result, dict); await add_speech_context(request.app.state.model, result, decoded, context_mode, speaker_session_id)
     except HTTPException: STATS.requests_failed += 1; raise
     finally: STATS.requests_active -= 1
     total_ms = (time.perf_counter() - started) * 1000; STATS.request_ms.append(total_ms); STATS.engine_ms.append(engine_ms); STATS.total_ms_sum += total_ms; STATS.engine_ms_sum += engine_ms; STATS.audio_seconds_total += decoded.duration
@@ -484,12 +527,23 @@ async def transcribe(request: Request, file: UploadFile | None = File(None), aud
 
 
 @app.post("/v1/audio/diarizations")
-async def diarizations(request: Request, file: UploadFile | None = File(None), audio_url: str | None = Form(None), identify: bool = Form(False), authorization: str | None = Header(None), x_api_key: str | None = Header(None, alias="X-API-Key")):
+async def diarizations(request: Request, file: UploadFile | None = File(None), audio_url: str | None = Form(None), identify: bool = Form(False), speaker_session_id: str | None = Form(None), authorization: str | None = Header(None), x_api_key: str | None = Header(None, alias="X-API-Key")):
     auth(authorization, x_api_key)
     if not await request.app.state.model.is_loaded(): raise HTTPException(503, "model_unavailable")
+    if speaker_session_id and not SPEAKER_SESSION_ID_RE.fullmatch(speaker_session_id): raise HTTPException(422, "speaker_session_id must match [a-zA-Z0-9_-]{1,64}")
     decoded = await get_audio(file, audio_url)
-    async with request.app.state.model.admit(): body = await diarize_audio(request.app.state.model, decoded, identify=identify)
+    async with request.app.state.model.admit(): body = await diarize_audio(request.app.state.model, decoded, identify=identify, session_id=speaker_session_id)
     body["duration"] = decoded.duration; return body
+
+
+@app.delete("/v1/audio/diarization-sessions/{session_id}", status_code=204)
+async def reset_diarization_session(request: Request, session_id: str, authorization: str | None = Header(None), x_api_key: str | None = Header(None, alias="X-API-Key")):
+    auth(authorization, x_api_key)
+    if not SPEAKER_SESSION_ID_RE.fullmatch(session_id): raise HTTPException(422, "speaker_session_id must match [a-zA-Z0-9_-]{1,64}")
+    reset = getattr(getattr(request.app.state.model, "diarizer", None), "reset_speaker_session", None)
+    if not callable(reset): raise HTTPException(503, "diarization_unavailable")
+    await reset(session_id)
+    return Response(status_code=204)
 
 
 def require_identity(request: Request):

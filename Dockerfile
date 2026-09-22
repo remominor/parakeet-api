@@ -7,9 +7,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates cmake git libopenblas-dev ninja-build python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
+COPY patches/transcribe-sortformer-persistent-state.patch /tmp/transcribe-sortformer-persistent-state.patch
 RUN git clone https://github.com/handy-computer/transcribe.cpp /src/transcribe.cpp \
     && git -C /src/transcribe.cpp checkout --detach "${TRANSCRIBE_CPP_COMMIT}" \
-    && test "$(git -C /src/transcribe.cpp rev-parse HEAD)" = "${TRANSCRIBE_CPP_COMMIT}"
+    && test "$(git -C /src/transcribe.cpp rev-parse HEAD)" = "${TRANSCRIBE_CPP_COMMIT}" \
+    && git -C /src/transcribe.cpp apply --check /tmp/transcribe-sortformer-persistent-state.patch \
+    && git -C /src/transcribe.cpp apply /tmp/transcribe-sortformer-persistent-state.patch
 RUN cmake -S /src/transcribe.cpp -B /build/transcribe -GNinja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/opt/transcribe \

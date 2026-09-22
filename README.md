@@ -63,6 +63,17 @@ JSON response. Enriched requests always include timed words and a
 statistics, component state, timing, and machine-readable degradation errors.
 ASR failure fails the request; optional enrichment fails open.
 
+For independent HTTP turns that belong to one household conversation, include
+`speaker_session_id` (matching `[a-zA-Z0-9_-]{1,64}`) with a diarization or
+full-context transcription, or with `POST /v1/audio/diarizations`. This keeps
+only bounded Sortformer AOSC/FIFO state and per-slot semantic identity bindings
+in memory; it never stores or replays prior audio. Omit it for the existing
+stateless behavior. Reset a session with
+`DELETE /v1/audio/diarization-sessions/{session_id}` (idempotent 204). Sessions
+expire after `PARAKEET_SPEAKER_SESSION_TTL_SECONDS` (default 3600) and are
+bounded by `PARAKEET_SPEAKER_SESSION_MAX` (default 16). WebSocket and realtime
+endpoints intentionally remain stateless.
+
 ```bash
 curl http://127.0.0.1:5092/v1/audio/transcriptions \
   -H 'Authorization: Bearer YOUR_KEY' \
@@ -198,7 +209,8 @@ Important variables are `PARAKEET_API_KEYS`, `PARAKEET_ASR_MODEL_FILE`,
 `PARAKEET_ASR_DEVICE`, `PARAKEET_DIARIZATION_DEVICE`,
 `PARAKEET_SPEAKER_STORE`, `PARAKEET_IDENTITY_THRESHOLD`,
 `PARAKEET_IDENTITY_MARGIN`, `PARAKEET_IDENTITY_MINIMUM_AUDIO_MS`, and the
-`PARAKEET_CAMPP_*THREADS`/`CONCURRENCY` controls. Docker/NVIDIA visibility
+`PARAKEET_SPEAKER_SESSION_TTL_SECONDS`, `PARAKEET_SPEAKER_SESSION_MAX`, and
+the `PARAKEET_CAMPP_*THREADS`/`CONCURRENCY` controls. Docker/NVIDIA visibility
 controls still determine which devices exist; selectors resolve exact devices
 from `transcribe_cpp.backends()` using the semantics above.
 

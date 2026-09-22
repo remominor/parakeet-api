@@ -1,0 +1,324 @@
+diff --git a/bindings/python/src/transcribe_cpp/__init__.py b/bindings/python/src/transcribe_cpp/__init__.py
+index 51687230..146e0a8b 100644
+--- a/bindings/python/src/transcribe_cpp/__init__.py
++++ b/bindings/python/src/transcribe_cpp/__init__.py
+@@ -859,15 +859,20 @@ class SortformerStreamOptions(FamilyExtension):
+         "low_latency": _generated.TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY,
+     }
+ 
+-    def __init__(self, *, preset: SortformerPreset | None = None):
++    def __init__(self, *, preset: SortformerPreset | None = None, preserve_state: bool = False):
+         if preset is not None and preset not in self._presets:
+             raise ValueError(f"unknown sortformer preset {preset!r}; "
+                              f"expected one of {sorted(self._presets)}")
+         self.preset = preset
++        self.preserve_state = preserve_state
+ 
+     def _apply(self, ext) -> None:
+         if self.preset is not None:
+             ext.preset = self._presets[self.preset]
++        ext.state_mode = (
++            _generated.TRANSCRIBE_SORTFORMER_STATE_PRESERVE if self.preserve_state
++            else _generated.TRANSCRIBE_SORTFORMER_STATE_RESET
++        )
+ 
+ 
+ # --- high-level handles ---------------------------------------------------
+@@ -1364,6 +1369,14 @@ class Session:
+         run/stream."""
+         self._cancel.set()
+ 
++    def reset_sortformer_state(self) -> None:
++        """Clear bounded AOSC/FIFO state on a Sortformer session.
++
++        This is valid only for Sortformer sessions and never retains or
++        replays caller PCM.
++        """
++        _check(_lib.transcribe_sortformer_reset_state(self._h), "resetting sortformer state")
++
+     @property
+     def was_aborted(self) -> bool:
+         """True if the most recent call was ended by cancel()."""
+diff --git a/bindings/python/src/transcribe_cpp/_generated.py b/bindings/python/src/transcribe_cpp/_generated.py
+index ac9763c2..b7aa9c7e 100644
+--- a/bindings/python/src/transcribe_cpp/_generated.py
++++ b/bindings/python/src/transcribe_cpp/_generated.py
+@@ -13,7 +13,7 @@ import ctypes as _c
+ # Stable digest of the ABI surface below (structs, enums, macros, layout,
+ # prototypes). A native provider package echoes this back so the API
+ # package can reject an ABI-mismatched provider before dlopen.
+-PUBLIC_HEADER_HASH = "7df72bf9e667b8c2"
++PUBLIC_HEADER_HASH = "0f76382a88042372"
+ 
+ # === enum constants ===
+ TRANSCRIBE_OK = 0
+@@ -106,6 +106,8 @@ TRANSCRIBE_SORTFORMER_PRESET_DEFAULT = 0
+ TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY = 1
+ TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY = 2
+ TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY = 3
++TRANSCRIBE_SORTFORMER_STATE_RESET = 0
++TRANSCRIBE_SORTFORMER_STATE_PRESERVE = 1
+ TRANSCRIBE_WHISPER_PROMPT_FIRST_SEGMENT = 0
+ TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS = 1
+ 
+@@ -181,7 +183,7 @@ transcribe_speaker_segment._fields_ = [("struct_size", _c.c_uint64), ("t0_ms", _
+ transcribe_moonshine_streaming_stream_ext._fields_ = [("ext", transcribe_ext), ("min_decode_interval_ms", _c.c_int32)]
+ transcribe_parakeet_stream_ext._fields_ = [("ext", transcribe_ext), ("att_context_right", _c.c_int32)]
+ transcribe_parakeet_buffered_stream_ext._fields_ = [("ext", transcribe_ext), ("left_ms", _c.c_int32), ("chunk_ms", _c.c_int32), ("right_ms", _c.c_int32)]
+-transcribe_sortformer_stream_ext._fields_ = [("ext", transcribe_ext), ("preset", _c.c_int)]
++transcribe_sortformer_stream_ext._fields_ = [("ext", transcribe_ext), ("preset", _c.c_int), ("state_mode", _c.c_int)]
+ transcribe_voxtral_realtime_stream_ext._fields_ = [("ext", transcribe_ext), ("num_delay_tokens", _c.c_int32), ("min_decode_interval_ms", _c.c_int32)]
+ transcribe_whisper_run_ext._fields_ = [("ext", transcribe_ext), ("initial_prompt", _c.c_char_p), ("prompt_tokens", _c.POINTER(_c.c_int32)), ("n_prompt_tokens", _c.c_size_t), ("prompt_condition", _c.c_int), ("condition_on_prev_tokens", _c.c_bool), ("max_prev_context_tokens", _c.c_int32), ("temperature", _c.c_float), ("temperature_inc", _c.c_float), ("compression_ratio_thold", _c.c_float), ("logprob_thold", _c.c_float), ("no_speech_thold", _c.c_float), ("seed", _c.c_uint32), ("max_initial_timestamp", _c.c_float)]
+ transcribe_whisper_chunk_trace._fields_ = [("struct_size", _c.c_uint64), ("t0_ms", _c.c_int64), ("t1_ms", _c.c_int64), ("temperature_used", _c.c_float), ("compression_ratio", _c.c_float), ("avg_logprob", _c.c_float), ("no_speech_prob", _c.c_float), ("no_speech_triggered", _c.c_bool), ("n_fallbacks", _c.c_int32)]
+@@ -226,7 +228,7 @@ STRUCT_LAYOUT = {
+     'transcribe_moonshine_streaming_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'min_decode_interval_ms': 16}},
+     'transcribe_parakeet_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'att_context_right': 16}},
+     'transcribe_parakeet_buffered_stream_ext': {'size': 32, 'align': 8, 'offsets': {'ext': 0, 'left_ms': 16, 'chunk_ms': 20, 'right_ms': 24}},
+-    'transcribe_sortformer_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'preset': 16}},
++    'transcribe_sortformer_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'preset': 16, 'state_mode': 20}},
+     'transcribe_voxtral_realtime_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'num_delay_tokens': 16, 'min_decode_interval_ms': 20}},
+     'transcribe_whisper_run_ext': {'size': 80, 'align': 8, 'offsets': {'ext': 0, 'initial_prompt': 16, 'prompt_tokens': 24, 'n_prompt_tokens': 32, 'prompt_condition': 40, 'condition_on_prev_tokens': 44, 'max_prev_context_tokens': 48, 'temperature': 52, 'temperature_inc': 56, 'compression_ratio_thold': 60, 'logprob_thold': 64, 'no_speech_thold': 68, 'seed': 72, 'max_initial_timestamp': 76}},
+     'transcribe_whisper_chunk_trace': {'size': 48, 'align': 8, 'offsets': {'struct_size': 0, 't0_ms': 8, 't1_ms': 16, 'temperature_used': 24, 'compression_ratio': 28, 'avg_logprob': 32, 'no_speech_prob': 36, 'no_speech_triggered': 40, 'n_fallbacks': 44}},
+@@ -377,6 +379,8 @@ def configure(lib):
+     lib.transcribe_session_params_init.argtypes = [_c.POINTER(transcribe_session_params)]
+     lib.transcribe_set_abort_callback.restype = None
+     lib.transcribe_set_abort_callback.argtypes = [_c.c_void_p, _c.CFUNCTYPE(_c.c_bool, _c.c_void_p), _c.c_void_p]
++    lib.transcribe_sortformer_reset_state.restype = _c.c_int
++    lib.transcribe_sortformer_reset_state.argtypes = [_c.c_void_p]
+     lib.transcribe_sortformer_stream_ext_init.restype = None
+     lib.transcribe_sortformer_stream_ext_init.argtypes = [_c.POINTER(transcribe_sortformer_stream_ext)]
+     lib.transcribe_speaker_segment_init.restype = None
+diff --git a/bindings/typescript/src/_generated.ts b/bindings/typescript/src/_generated.ts
+index fff2ca59..d8a570bf 100644
+--- a/bindings/typescript/src/_generated.ts
++++ b/bindings/typescript/src/_generated.ts
+@@ -11,7 +11,7 @@
+ // Stable digest of the ABI surface (structs, enums, macros, layout,
+ // prototypes), computed by the Python oracle and pinned here so a header
+ // ABI change turns this binding's drift check red for conscious review.
+-export const PUBLIC_HEADER_HASH = "7df72bf9e667b8c2";
++export const PUBLIC_HEADER_HASH = "0f76382a88042372";
+ 
+ // === enum constants ===
+ export const TRANSCRIBE_OK = 0;
+@@ -104,6 +104,8 @@ export const TRANSCRIBE_SORTFORMER_PRESET_DEFAULT = 0;
+ export const TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY = 1;
+ export const TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY = 2;
+ export const TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY = 3;
++export const TRANSCRIBE_SORTFORMER_STATE_RESET = 0;
++export const TRANSCRIBE_SORTFORMER_STATE_PRESERVE = 1;
+ export const TRANSCRIBE_WHISPER_PROMPT_FIRST_SEGMENT = 0;
+ export const TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS = 1;
+ 
+@@ -135,7 +137,7 @@ export const STRUCT_LAYOUT: Record<string, StructLayout> = {
+   'transcribe_moonshine_streaming_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'min_decode_interval_ms': 16} },
+   'transcribe_parakeet_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'att_context_right': 16} },
+   'transcribe_parakeet_buffered_stream_ext': { size: 32, align: 8, offsets: {'ext': 0, 'left_ms': 16, 'chunk_ms': 20, 'right_ms': 24} },
+-  'transcribe_sortformer_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'preset': 16} },
++  'transcribe_sortformer_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'preset': 16, 'state_mode': 20} },
+   'transcribe_voxtral_realtime_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'num_delay_tokens': 16, 'min_decode_interval_ms': 20} },
+   'transcribe_whisper_run_ext': { size: 80, align: 8, offsets: {'ext': 0, 'initial_prompt': 16, 'prompt_tokens': 24, 'n_prompt_tokens': 32, 'prompt_condition': 40, 'condition_on_prev_tokens': 44, 'max_prev_context_tokens': 48, 'temperature': 52, 'temperature_inc': 56, 'compression_ratio_thold': 60, 'logprob_thold': 64, 'no_speech_thold': 68, 'seed': 72, 'max_initial_timestamp': 76} },
+   'transcribe_whisper_chunk_trace': { size: 48, align: 8, offsets: {'struct_size': 0, 't0_ms': 8, 't1_ms': 16, 'temperature_used': 24, 'compression_ratio': 28, 'avg_logprob': 32, 'no_speech_prob': 36, 'no_speech_triggered': 40, 'n_fallbacks': 44} },
+@@ -180,7 +182,7 @@ export function defineTypes(koffi: any): Record<string, any> {
+   T['transcribe_moonshine_streaming_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], min_decode_interval_ms: 'int32_t' });
+   T['transcribe_parakeet_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], att_context_right: 'int32_t' });
+   T['transcribe_parakeet_buffered_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], left_ms: 'int32_t', chunk_ms: 'int32_t', right_ms: 'int32_t' });
+-  T['transcribe_sortformer_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], preset: 'int' });
++  T['transcribe_sortformer_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], preset: 'int', state_mode: 'int' });
+   T['transcribe_voxtral_realtime_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], num_delay_tokens: 'int32_t', min_decode_interval_ms: 'int32_t' });
+   T['transcribe_whisper_run_ext'] = koffi.struct({ ext: T['transcribe_ext'], initial_prompt: 'char *', prompt_tokens: 'void *', n_prompt_tokens: 'size_t', prompt_condition: 'int', condition_on_prev_tokens: 'bool', max_prev_context_tokens: 'int32_t', temperature: 'float', temperature_inc: 'float', compression_ratio_thold: 'float', logprob_thold: 'float', no_speech_thold: 'float', seed: 'uint32_t', max_initial_timestamp: 'float' });
+   T['transcribe_whisper_chunk_trace'] = koffi.struct({ struct_size: 'uint64_t', t0_ms: 'int64_t', t1_ms: 'int64_t', temperature_used: 'float', compression_ratio: 'float', avg_logprob: 'float', no_speech_prob: 'float', no_speech_triggered: 'bool', n_fallbacks: 'int32_t' });
+@@ -260,6 +262,7 @@ export const FUNCTION_SIGNATURES: Record<string, FnSig> = {
+   'transcribe_session_limits_init': { ret: 'void', args: ['struct transcribe_session_limits *'] },
+   'transcribe_session_params_init': { ret: 'void', args: ['struct transcribe_session_params *'] },
+   'transcribe_set_abort_callback': { ret: 'void', args: ['struct transcribe_session *', 'transcribe_abort_callback', 'void *'] },
++  'transcribe_sortformer_reset_state': { ret: 'transcribe_status', args: ['struct transcribe_session *'] },
+   'transcribe_sortformer_stream_ext_init': { ret: 'void', args: ['struct transcribe_sortformer_stream_ext *'] },
+   'transcribe_speaker_segment_init': { ret: 'void', args: ['struct transcribe_speaker_segment *'] },
+   'transcribe_status_string': { ret: 'const char *', args: ['int'] },
+diff --git a/include/transcribe.abihash b/include/transcribe.abihash
+index b0e23c5d..a5bd5f12 100644
+--- a/include/transcribe.abihash
++++ b/include/transcribe.abihash
+@@ -1 +1 @@
+-7df72bf9e667b8c2
++0f76382a88042372
+diff --git a/include/transcribe/sortformer.h b/include/transcribe/sortformer.h
+index 751b11c8..ca414040 100644
+--- a/include/transcribe/sortformer.h
++++ b/include/transcribe/sortformer.h
+@@ -66,14 +66,25 @@ typedef enum {
+     TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY       = 3,
+ } transcribe_sortformer_preset;
+ 
++/* RESET is the legacy, stateless behavior. PRESERVE retains bounded AOSC /
++ * FIFO speaker state while clearing result accumulation for the new run. */
++typedef enum {
++    TRANSCRIBE_SORTFORMER_STATE_RESET    = 0,
++    TRANSCRIBE_SORTFORMER_STATE_PRESERVE = 1,
++} transcribe_sortformer_state_mode;
++
+ struct transcribe_sortformer_stream_ext {
+     struct transcribe_ext        ext;
+     transcribe_sortformer_preset preset;
++    transcribe_sortformer_state_mode state_mode;
+ };
+ 
+ /* Fills ext.size/kind and preset = DEFAULT (GGUF-shipped cfg). */
+ TRANSCRIBE_API void transcribe_sortformer_stream_ext_init(struct transcribe_sortformer_stream_ext * ext);
+ 
++/* Fully clear persistent Sortformer stream state on a Sortformer session. */
++TRANSCRIBE_API transcribe_status transcribe_sortformer_reset_state(struct transcribe_session * session);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/arch/parakeet/multitalker.cpp b/src/arch/parakeet/multitalker.cpp
+index 9fd80874..8e53c2df 100644
+--- a/src/arch/parakeet/multitalker.cpp
++++ b/src/arch/parakeet/multitalker.cpp
+@@ -412,7 +412,7 @@ transcribe_status run_multitalker(ParakeetSession *             pc,
+     transcribe::debug::push_name_prefix("mt.diar");
+     const transcribe_status dst = sf::run_diar_streaming_core(
+         pc->diar_scratch, diar.hp, diar.conformer_hp, diar.conformer, diar.weights, pm->backend.c_str(), pc->sched,
+-        pc->n_threads, P, diar_mel.data(), dm_mels, dm_frames, pc);
++        pc->n_threads, P, diar_mel.data(), dm_mels, dm_frames, pc, false);
+     transcribe::debug::pop_name_prefix();
+     if (dst != TRANSCRIBE_OK) {
+         return dst;
+diff --git a/src/arch/sortformer/model.cpp b/src/arch/sortformer/model.cpp
+index 3544e9e8..7bc1da36 100644
+--- a/src/arch/sortformer/model.cpp
++++ b/src/arch/sortformer/model.cpp
+@@ -811,7 +811,8 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
+                                           const float *                  mel_buf,
+                                           int                            mel_n_mels,
+                                           int                            mel_n_frames,
+-                                          transcribe_session *           abort_session) {
++                                          transcribe_session *           abort_session,
++                                          bool                           preserve_state) {
+     const int ed       = chp.enc_d_model;
+     const int n_spk    = hp.max_speakers;
+     const int sub      = hp.enc_subsampling_factor;
+@@ -820,7 +821,11 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
+     if (sub <= 0 || P.chunk_len <= 0 || sched == nullptr || mel_buf == nullptr) {
+         return TRANSCRIBE_ERR_INVALID_ARG;
+     }
+-    sc.stream.reset(ed);
++    if (preserve_state) {
++        sc.stream.reset_run_output();
++    } else {
++        sc.stream.reset(ed);
++    }
+ 
+     const bool external_cadence = P.feat_first_chunk > 0;
+     if (external_cadence && (P.chunk_left_context != 0 || P.chunk_right_context != 0)) {
+@@ -980,7 +985,8 @@ static transcribe_status run_streaming(SortformerSession *          pc,
+                                        int                          mel_n_mels,
+                                        int                          mel_n_frames,
+                                        double                       ms_per_frame,
+-                                       transcribe_sortformer_preset preset) {
++                                       transcribe_sortformer_preset preset,
++                                       bool                         preserve_state) {
+     const SortformerStreamParams P = resolve_stream_params(pm->hparams, preset);
+     if (const transcribe_status st = ensure_sched(pc, pm); st != TRANSCRIBE_OK) {
+         return st;
+@@ -989,7 +995,7 @@ static transcribe_status run_streaming(SortformerSession *          pc,
+     const int64_t           t_stream_start = ggml_time_us();
+     const transcribe_status st = run_diar_streaming_core(pc->scratch, pm->hparams, pm->conformer_hp, pm->conformer,
+                                                          pm->weights, pm->backend.c_str(), pc->sched, pc->n_threads, P,
+-                                                         pc->mel_buf.data(), mel_n_mels, mel_n_frames, pc);
++                                                         pc->mel_buf.data(), mel_n_mels, mel_n_frames, pc, preserve_state);
+     if (st != TRANSCRIBE_OK) {
+         return st;
+     }
+@@ -1025,13 +1031,16 @@ transcribe_status run(transcribe_session *          session,
+     // Streaming operating-point run ext (kind/size/range already validated
+     // by the dispatcher + run_validate pre-clear; re-check is belt-and-braces).
+     transcribe_sortformer_preset preset = TRANSCRIBE_SORTFORMER_PRESET_DEFAULT;
++    transcribe_sortformer_state_mode state_mode = TRANSCRIBE_SORTFORMER_STATE_RESET;
+     if (params != nullptr && params->family != nullptr) {
+         if (const transcribe_status st = transcribe_ext_check(params->family, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM,
+                                                               sizeof(struct transcribe_sortformer_stream_ext));
+             st != TRANSCRIBE_OK) {
+             return st;
+         }
+-        preset = reinterpret_cast<const transcribe_sortformer_stream_ext *>(params->family)->preset;
++        const auto * ext = reinterpret_cast<const transcribe_sortformer_stream_ext *>(params->family);
++        preset = ext->preset;
++        state_mode = ext->state_mode;
+     }
+     pc->clear_result();
+     transcribe::debug::init();
+@@ -1061,7 +1070,8 @@ transcribe_status run(transcribe_session *          session,
+     }
+ 
+     // Streaming AOSC/FIFO forward drives the product output + diar.probs.
+-    if (const transcribe_status st = run_streaming(pc, pm, mel_n_mels, mel_n_frames, ms_per_frame, preset);
++    if (const transcribe_status st = run_streaming(pc, pm, mel_n_mels, mel_n_frames, ms_per_frame, preset,
++                                                    state_mode == TRANSCRIBE_SORTFORMER_STATE_PRESERVE);
+         st != TRANSCRIBE_OK) {
+         return st;
+     }
+@@ -1102,9 +1112,14 @@ static transcribe_status run_validate(const transcribe_session * /*ctx*/, const
+         case TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY:
+         case TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY:
+         case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
+-            return TRANSCRIBE_OK;
++            break;
++        default:
++            return TRANSCRIBE_ERR_INVALID_ARG;
++    }
++    if (ext->state_mode != TRANSCRIBE_SORTFORMER_STATE_RESET && ext->state_mode != TRANSCRIBE_SORTFORMER_STATE_PRESERVE) {
++        return TRANSCRIBE_ERR_INVALID_ARG;
+     }
+-    return TRANSCRIBE_ERR_INVALID_ARG;
++    return TRANSCRIBE_OK;
+ }
+ 
+ extern const Arch arch = {
+@@ -1138,4 +1153,16 @@ extern "C" void transcribe_sortformer_stream_ext_init(struct transcribe_sortform
+     p->ext.size = sizeof(*p);
+     p->ext.kind = TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM;
+     p->preset   = TRANSCRIBE_SORTFORMER_PRESET_DEFAULT;
++    p->state_mode = TRANSCRIBE_SORTFORMER_STATE_RESET;
++}
++
++extern "C" transcribe_status transcribe_sortformer_reset_state(struct transcribe_session * session) {
++    if (session == nullptr || session->model == nullptr || session->model->arch != &transcribe::sortformer::arch) {
++        return TRANSCRIBE_ERR_INVALID_ARG;
++    }
++    auto * pc = static_cast<transcribe::sortformer::SortformerSession *>(session);
++    auto * pm = static_cast<transcribe::sortformer::SortformerModel *>(session->model);
++    pc->scratch.stream.reset(pm->conformer_hp.enc_d_model);
++    pc->clear_result();
++    return TRANSCRIBE_OK;
+ }
+diff --git a/src/arch/sortformer/sortformer.h b/src/arch/sortformer/sortformer.h
+index bb31eedd..458203fd 100644
+--- a/src/arch/sortformer/sortformer.h
++++ b/src/arch/sortformer/sortformer.h
+@@ -139,6 +139,13 @@ struct SortformerStreamState {
+         total_n        = 0;
+         compress_count = 0;
+     }
++
++    // A preserved stream starts a new result timeline but retains bounded
++    // speaker cache/FIFO/silence state derived from prior chunks.
++    void reset_run_output() {
++        total_preds.clear();
++        total_n = 0;
++    }
+ };
+ 
+ // Resolve the streaming operating point, lowest to highest precedence:
+@@ -252,7 +259,8 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &
+                                           const float *                                 mel_buf,
+                                           int                                           mel_n_mels,
+                                           int                                           mel_n_frames,
+-                                          transcribe_session *                          abort_session);
++                                          transcribe_session *                          abort_session,
++                                          bool                                          preserve_state = false);
+ 
+ // Threshold-based probs -> speaker_segment rows (probs row-major [T, n_spk],
+ // speaker_id 1-based, p = NaN). Shared with the multitalker bundle path.

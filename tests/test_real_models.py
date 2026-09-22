@@ -25,6 +25,21 @@ class RealModelTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await backend.close()
 
+    @unittest.skipUnless(os.getenv("PARAKEET_REAL_DIARIZATION_MODEL"), "set PARAKEET_REAL_DIARIZATION_MODEL for opt-in native tests")
+    async def test_diarizer_stateful_session_api_and_reset(self):
+        """Exercise the patched binding without retaining or replaying PCM."""
+        from gateway.backends import TranscribeCppDiarizer
+        backend = TranscribeCppDiarizer(os.environ["PARAKEET_REAL_DIARIZATION_MODEL"], device_selector=os.getenv("PARAKEET_DIARIZATION_DEVICE"))
+        try:
+            await backend.diarize(np.zeros(32000, dtype=np.float32), session_id="native-state-test")
+            first = backend._speaker_sessions["native-state-test"].native_session
+            await backend.diarize(np.zeros(16000, dtype=np.float32), session_id="native-state-test")
+            self.assertIs(backend._speaker_sessions["native-state-test"].native_session, first)
+            first.reset_sortformer_state()
+            self.assertTrue(await backend.reset_speaker_session("native-state-test"))
+        finally:
+            await backend.close()
+
     @unittest.skipUnless(os.getenv("PARAKEET_REAL_CAMPP_MODEL"), "set PARAKEET_REAL_CAMPP_MODEL for opt-in native tests")
     async def test_campp_load_and_run(self):
         from gateway.speakers import CampPlusONNX
