@@ -34,6 +34,14 @@ Models may be mounted at `/models/{asr,diarization,campp}` or at `/models`.
 compatibility fallback. Unified is the default. Set
 `PARAKEET_ASR_MODEL_FILE=parakeet-tdt-0.6b-v2-Q8_0.gguf` for rollback.
 
+Device selectors should normally be the stable `device_id` reported by
+transcribe.cpp (for NVIDIA this is typically a PCI identifier). Bare numeric
+registry indices are rejected because they are process-local. `cuda:N` is an
+optional convenience selector meaning the Nth CUDA device after filtering out
+all non-CUDA backends. When `PARAKEET_DIARIZATION_DEVICE` is empty, Sortformer
+inherits `PARAKEET_ASR_DEVICE`; an explicit diarization selector overrides it.
+Startup logs report each resolved device's kind, name, and stable `device_id`.
+
 Sortformer and identity are opt-in:
 
 ```dotenv
@@ -76,7 +84,9 @@ Additional authenticated endpoints:
 `/readyz` is ASR decisive: optional component degradation does not make the
 service unready. GPU memory is process-level because native per-model
 allocation is unavailable; component VRAM remains `null` rather than being
-invented.
+invented. Health includes `gpu_memory`, a per-GPU list of UUID and process
+memory, while the legacy `vram_allocated_mb`/`vram_reserved_mb` fields are the
+sum across those GPUs and are labelled with `gpu_memory_scope=process_total`.
 
 ### Speaker identity and privacy
 
@@ -93,7 +103,11 @@ matching. Enrollment never overwrites an ID.
 
 Threshold and ambiguity margin are unset by default. Enrollment and embedding
 remain available, but matching returns `calibration_required`; full-context
-transcription still returns diarization. Calibrate from a labeled JSONL file:
+transcription still returns diarization. A threshold is always required. With
+one compatible enrolled speaker, that threshold alone permits known/unknown
+matching. With multiple candidates, all-speaker matching also requires the
+ambiguity margin. Targeted verification only requires the threshold. Calibrate
+from a labeled JSONL file:
 
 ```json
 {"speaker_id":"alice","audio":"fixtures/alice-1.wav"}
@@ -122,6 +136,24 @@ production image.
 
 Both use the same in-process ASR abstraction. Queue depth remains two,
 oversized frames are rejected, and no WebSocket diarization is performed.
+
+## Web UI
+
+Set `PARAKEET_WEBUI_ENABLED=true` and open `/` to use the lightweight manual
+speech console. It preserves upload/drop, microphone transcription, playback,
+clickable timestamped words, confidence highlighting, re-run, and TXT/JSON/
+SRT/VTT export. Speech context defaults to `none`, so Sortformer and CAM++ are
+not run unless diarization or full identity context is selected.
+
+When enabled by `/info`, the same page renders diarization statistics,
+speaker-aware words, identity states and raw speech-context JSON. It can also
+collect multiple uploaded or microphone enrollment samples, list compatible
+speaker templates, verify a selected speaker (or identify against all), and
+delete a speaker after confirmation. The API key remains in `sessionStorage`.
+Microphone blobs remain in browser memory until an explicit action and are
+discarded when removed or the page closes. Raw enrollment recordings are not
+persisted by the server; only private templates under `/data/speakers` are
+stored, and embeddings are never returned by public APIs.
 
 ## Verification and benchmarking
 
@@ -159,7 +191,7 @@ Important variables are `PARAKEET_API_KEYS`, `PARAKEET_ASR_MODEL_FILE`,
 `PARAKEET_IDENTITY_MARGIN`, `PARAKEET_IDENTITY_MINIMUM_AUDIO_MS`, and the
 `PARAKEET_CAMPP_*THREADS`/`CONCURRENCY` controls. Docker/NVIDIA visibility
 controls still determine which devices exist; selectors resolve exact devices
-from `transcribe_cpp.backends()`.
+from `transcribe_cpp.backends()` using the semantics above.
 
 Word confidence intentionally changed from parakeet.cpp max probability to the
 minimum native entropy-based token confidence belonging to each word.
