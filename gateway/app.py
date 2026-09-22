@@ -291,7 +291,7 @@ async def lifespan(app: FastAPI):
         await app.state.model.shutdown()
 
 
-async def engine_transcribe(app: FastAPI, payload: bytes | DecodedAudio | np.ndarray, form: dict[str, Any] | None = None, *, parse_json: bool = True) -> tuple[dict[str, Any] | str, float]:
+async def engine_transcribe(app: FastAPI, payload: bytes | DecodedAudio | np.ndarray, form: dict[str, Any] | None = None, *, parse_json: bool = True, admitted: bool = False) -> tuple[dict[str, Any] | str, float]:
     if isinstance(payload, bytes):
         decoded = await asyncio.to_thread(decode_audio, payload)
     elif isinstance(payload, DecodedAudio):
@@ -299,17 +299,26 @@ async def engine_transcribe(app: FastAPI, payload: bytes | DecodedAudio | np.nda
     else:
         pcm = np.asarray(payload, dtype=np.float32); decoded = DecodedAudio(pcm, len(pcm) / TARGET_RATE, False)
     STATS.requests_queued += 1
+    queued = True
     try:
-        async with app.state.model.admit():
-            STATS.requests_queued -= 1; started = time.perf_counter()
+        async def execute():
+            nonlocal queued
+            STATS.requests_queued -= 1; queued = False
+            started = time.perf_counter()
             result: TranscriptionResult = await app.state.model.asr.transcribe(decoded.pcm, decoded.duration)
-            engine_ms = (time.perf_counter() - started) * 1000
+            return result, (time.perf_counter() - started) * 1000
+        if admitted:
+            result, engine_ms = await execute()
+        else:
+            async with app.state.model.admit():
+                result, engine_ms = await execute()
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(502, f"speech engine unavailable: {exc.__class__.__name__}: {exc}") from exc
     finally:
-        STATS.requests_queued = max(0, STATS.requests_queued)
+        if queued:
+            STATS.requests_queued -= 1
     if not parse_json:
         return result.text, engine_ms
     needs_words = not form or form.get("response_format") == "verbose_json" or "word" in form.get("timestamp_granularities[]", [])
@@ -389,7 +398,7 @@ async def metrics():
     if not SETTINGS.metrics_enabled: raise HTTPException(404, "metrics endpoint is disabled")
     def summary(name, values):
         values_ms = percentiles(values); return [f"# TYPE {name} summary", f'{name}{{quantile="0.5"}} {values_ms["p50"] / 1000}', f'{name}{{quantile="0.95"}} {values_ms["p95"] / 1000}', f'{name}{{quantile="0.99"}} {values_ms["p99"] / 1000}', f"{name}_count {values_ms['samples']}"]
-    lines = ["# TYPE parakeet_requests_total counter", f"parakeet_requests_total {STATS.requests_total}", f"parakeet_requests_failed_total {STATS.requests_failed}", f"parakeet_audio_seconds_total {STATS.audio_seconds_total}", f"parakeet_transcoded_total {STATS.transcoded_total}", f"parakeet_passthrough_total {STATS.passthrough_total}", f"parakeet_diarization_total {STATS.diarization_total}", f"parakeet_diarization_failed_total {STATS.diarization_failed}", f"parakeet_identity_total {STATS.identity_total}", f"parakeet_identity_failed_total {STATS.identity_failed}", f"parakeet_ws_connections_active {STATS.websocket_connections_active}", f"parakeet_ws_turns_total {STATS.websocket_turns_total}"] + summary("parakeet_engine_duration_seconds", STATS.engine_ms) + summary("parakeet_request_duration_seconds", STATS.request_ms) + summary("parakeet_diarization_duration_seconds", STATS.diarization_ms) + summary("parakeet_identity_duration_seconds", STATS.identity_ms)
+    lines = ["# TYPE parakeet_requests_total counter", f"parakeet_requests_total {STATS.requests_total}", f"parakeet_requests_failed_total {STATS.requests_failed}", "# TYPE parakeet_requests_active gauge", f"parakeet_requests_active {STATS.requests_active}", "# TYPE parakeet_requests_queued gauge", f"parakeet_requests_queued {STATS.requests_queued}", f"parakeet_audio_seconds_total {STATS.audio_seconds_total}", f"parakeet_transcoded_total {STATS.transcoded_total}", f"parakeet_passthrough_total {STATS.passthrough_total}", f"parakeet_diarization_total {STATS.diarization_total}", f"parakeet_diarization_failed_total {STATS.diarization_failed}", f"parakeet_identity_total {STATS.identity_total}", f"parakeet_identity_failed_total {STATS.identity_failed}", f"parakeet_ws_connections_active {STATS.websocket_connections_active}", f"parakeet_ws_turns_total {STATS.websocket_turns_total}"] + summary("parakeet_engine_duration_seconds", STATS.engine_ms) + summary("parakeet_request_duration_seconds", STATS.request_ms) + summary("parakeet_diarization_duration_seconds", STATS.diarization_ms) + summary("parakeet_identity_duration_seconds", STATS.identity_ms)
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
@@ -435,6 +444,9 @@ async def add_speech_context(manager: ModelManager, result: dict, decoded: Decod
         if errors: context["status"] = "degraded"
     except HTTPException as exc:
         context["status"] = "degraded"; context["errors"].append({"component": "diarization", "code": "unavailable" if exc.status_code == 503 else "inference_failed", "message": str(exc.detail)})
+    except Exception:
+        LOG.exception("unexpected optional speech-context failure")
+        context["status"] = "degraded"; context["errors"].append({"component": "enrichment", "code": "unexpected_error", "message": "optional speech-context processing failed"})
     context["timings"]["total_enrichment_ms"] = round((time.perf_counter() - started) * 1000, 1); result["speech_context"] = context
 
 
@@ -451,8 +463,9 @@ async def transcribe(request: Request, file: UploadFile | None = File(None), aud
     if needs_words and "word" not in granularities: granularities.append("word")
     form = {"response_format": "verbose_json" if needs_words else output, "timestamp_granularities[]": granularities}; engine_ms = 0.0
     try:
-        result, engine_ms = await engine_transcribe(request.app, decoded, form, parse_json=output != "text")
-        if context_mode != "none": assert isinstance(result, dict); await add_speech_context(request.app.state.model, result, decoded, context_mode)
+        async with request.app.state.model.admit():
+            result, engine_ms = await engine_transcribe(request.app, decoded, form, parse_json=output != "text", admitted=True)
+            if context_mode != "none": assert isinstance(result, dict); await add_speech_context(request.app.state.model, result, decoded, context_mode)
     except HTTPException: STATS.requests_failed += 1; raise
     finally: STATS.requests_active -= 1
     total_ms = (time.perf_counter() - started) * 1000; STATS.request_ms.append(total_ms); STATS.engine_ms.append(engine_ms); STATS.total_ms_sum += total_ms; STATS.engine_ms_sum += engine_ms; STATS.audio_seconds_total += decoded.duration

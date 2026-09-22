@@ -133,8 +133,6 @@ class SpeakerStore:
 
     def create(self, speaker_id: str, display_name: str | None, embeddings: Iterable[np.ndarray]) -> SpeakerRecord:
         path = self._path(speaker_id)
-        if path.exists():
-            raise FileExistsError(speaker_id)
         vectors = [l2_normalize(item) for item in embeddings]
         if not vectors or any(item.shape != (512,) for item in vectors):
             raise ValueError("enrollment requires one or more 512-dimensional embeddings")
@@ -161,8 +159,14 @@ class SpeakerStore:
                 json.dump(payload, stream, separators=(",", ":"), allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
+            # A same-filesystem hard link is an atomic no-replace publish:
+            # exactly one concurrent creator can claim the final name.
+            os.link(temporary, path)
+            directory_fd = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -222,10 +226,12 @@ def match_embedding(
     compatible = [item for item in records if item.compatibility == "compatible" and item.embedding is not None]
     if target is not None:
         compatible = [item for item in compatible if item.speaker_id == target]
-    if threshold is None or (target is None and margin is None):
+    if threshold is None:
         return {"status": "calibration_required"}
     if not compatible:
         return {"status": "unknown", "score": None}
+    if target is None and len(compatible) > 1 and margin is None:
+        return {"status": "calibration_required"}
     query = l2_normalize(embedding)
     ranked = sorted(((float(np.dot(query, item.embedding)), item) for item in compatible), reverse=True, key=lambda value: value[0])
     top_score, top = ranked[0]

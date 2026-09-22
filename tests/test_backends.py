@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from gateway.backends import TranscribeCppASR, model_identity
+from gateway.backends import TranscribeCppASR, model_identity, resolve_device
 
 
 class FakeSession:
@@ -28,6 +28,18 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         result = await backend.transcribe(np.zeros(16000, dtype=np.float32), 1.0)
         self.assertEqual(result.words[0].confidence, .7)
         self.assertEqual(result.native_timings["decode_ms"], 4)
+
+    def test_device_selection_rejects_registry_index_and_supports_cuda_ordinal(self):
+        devices = (
+            SimpleNamespace(index=0, kind="cpu", name="CPU", device_id="cpu"),
+            SimpleNamespace(index=7, kind="cuda", name="GPU A", device_id="0000:01:00.0"),
+            SimpleNamespace(index=2, kind="cuda", name="GPU B", device_id="0000:02:00.0"),
+        )
+        module = SimpleNamespace(backends=lambda: devices)
+        with self.assertRaisesRegex(RuntimeError, "bare numeric"):
+            resolve_device(module, "1")
+        self.assertIs(resolve_device(module, "cuda:1"), devices[2])
+        self.assertIs(resolve_device(module, "0000:01:00.0"), devices[1])
 
 
 if __name__ == "__main__":

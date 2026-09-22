@@ -92,14 +92,17 @@ def resolve_device(module, selector: str | None):
         return None
     devices = module.backends()
     if selector.isdigit():
-        index = int(selector)
-        return next((device for device in devices if device.index == index), None) or _missing_device(selector)
+        raise RuntimeError("bare numeric device selectors are unstable; use a stable device_id or cuda:N")
     lowered = selector.lower()
+    if lowered.startswith("cuda:") and lowered[5:].isdigit():
+        cuda_devices = [device for device in devices if _device_kind(device) == "cuda"]
+        index = int(lowered[5:])
+        return cuda_devices[index] if index < len(cuda_devices) else _missing_device(selector)
     return next(
         (
             device
             for device in devices
-            if lowered in {str(device.device_id).lower(), device.name.lower(), device.kind.lower()}
+            if lowered in {str(device.device_id).lower(), str(device.name).lower(), _device_kind(device)}
         ),
         None,
     ) or _missing_device(selector)
@@ -107,6 +110,14 @@ def resolve_device(module, selector: str | None):
 
 def _missing_device(selector: str):
     raise RuntimeError(f"transcribe.cpp device {selector!r} is not available")
+
+
+def _device_kind(device) -> str:
+    return str(getattr(device, "kind", getattr(device, "device_type", ""))).lower().split(".")[-1]
+
+
+def device_description(device) -> dict[str, str | None]:
+    return {"kind": _device_kind(device), "name": str(device.name), "device_id": str(device.device_id) if device.device_id else None}
 
 
 class TranscribeCppASR:
@@ -123,6 +134,7 @@ class TranscribeCppASR:
         self._session = self._model.session(n_threads=threads)
         native_device = self._model.device
         self.device = native_device.device_id or native_device.name or native_device.kind
+        self.device_description = device_description(native_device)
         self._lock = asyncio.Lock()
 
     @property
@@ -178,6 +190,7 @@ class TranscribeCppDiarizer:
         self._session = self._model.session(n_threads=threads)
         native_device = self._model.device
         self.device = native_device.device_id or native_device.name or native_device.kind
+        self.device_description = device_description(native_device)
         self._options = transcribe_cpp.SortformerStreamOptions(preset="very_high_latency")
         self._lock = asyncio.Lock()
 

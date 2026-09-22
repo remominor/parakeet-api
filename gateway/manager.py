@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -14,6 +15,8 @@ from fastapi import HTTPException
 from .artifacts import verify_artifact
 from .backends import TranscribeCppASR, TranscribeCppDiarizer, model_identity
 from .speakers import CampPlusONNX, IdentityService, SpeakerStore
+
+LOG = logging.getLogger("parakeet-api")
 
 
 def env_bool(name: str, default: str = "false") -> bool:
@@ -74,8 +77,8 @@ class StackConfig:
             speaker_store=Path(os.getenv("PARAKEET_SPEAKER_STORE", "/data/speakers")),
             diarization_enabled=env_bool("PARAKEET_DIARIZATION_ENABLED"),
             identity_enabled=env_bool("PARAKEET_IDENTITY_ENABLED"),
-            asr_device=os.getenv("PARAKEET_ASR_DEVICE"),
-            diarization_device=os.getenv("PARAKEET_DIARIZATION_DEVICE"),
+            asr_device=os.getenv("PARAKEET_ASR_DEVICE") or None,
+            diarization_device=os.getenv("PARAKEET_DIARIZATION_DEVICE") or os.getenv("PARAKEET_ASR_DEVICE") or None,
             native_threads=int(os.getenv("PARAKEET_NATIVE_THREADS", "0")),
             campp_intra_threads=int(os.getenv("PARAKEET_CAMPP_INTRA_THREADS", "0")),
             campp_inter_threads=int(os.getenv("PARAKEET_CAMPP_INTER_THREADS", "1")),
@@ -104,7 +107,10 @@ class ModelManager:
         self.idle = asyncio.Event()
         self.idle.set()
         self.admitted = 0
-        self.task: asyncio.Task | None = None
+        self.task: asyncio.Task | None = None  # compatibility alias for the latest lifecycle task
+        self.load_task: asyncio.Task | None = None
+        self.unload_task: asyncio.Task | None = None
+        self.generation = 0
         self.load_after_unload = False
         self.asr = None
         self.diarizer = None
@@ -117,7 +123,7 @@ class ModelManager:
         # Kept as a no-op compatibility attribute for older operational tests.
         self.process = None
         self.telemetry_at = 0.0
-        self.telemetry: tuple[str | None, int | None] = (None, 0)
+        self.telemetry: dict[str, Any] = {"gpu_memory": [], "total_mb": 0}
 
     async def is_loaded(self) -> bool:
         async with self.lock:
@@ -132,18 +138,24 @@ class ModelManager:
             if self.state == "unloading":
                 self.load_after_unload = True
                 return self.state, True
+            self.generation += 1
+            generation = self.generation
             self.state = "loading"
-            self.task = asyncio.create_task(self._load())
+            self.components = {"asr": {"status": "loading", "required": True}}
+            self.load_task = asyncio.create_task(self._load(generation))
+            self.task = self.load_task
             return self.state, True
 
     async def request_unload(self) -> tuple[str, bool]:
         async with self.lock:
-            if self.state == "unloaded":
+            if self.state == "unloaded" and not (self.load_task and not self.load_task.done()):
                 return self.state, False
             if self.state == "unloading":
                 return self.state, True
+            self.generation += 1
             self.state = "unloading"
-            self.task = asyncio.create_task(self._unload())
+            self.unload_task = asyncio.create_task(self._unload(self.load_task))
+            self.task = self.unload_task
             return self.state, True
 
     @asynccontextmanager
@@ -161,10 +173,18 @@ class ModelManager:
                 if not self.admitted:
                     self.idle.set()
 
-    async def _load(self) -> None:
+    @staticmethod
+    async def _close(value) -> None:
+        if value is not None:
+            await value.close()
+
+    async def _load(self, generation: int) -> None:
         asr = diarizer = None
+        embedding = self.embedding
+        identity = self.identity
+        new_embedding = False
+        components: dict[str, dict] = {"asr": {"status": "loading", "required": True}}
         try:
-            self.components = {"asr": {"status": "loading", "required": True}}
             await asyncio.to_thread(verify_artifact, self.config.asr_model, allow_unpinned=env_bool("PARAKEET_ALLOW_UNPINNED_MODELS"))
             asr = await asyncio.to_thread(
                 self._asr_factory,
@@ -174,11 +194,10 @@ class ModelManager:
             )
             if hasattr(asr, "warm"):
                 await asr.warm()
-            self.asr = asr
-            self.components["asr"] = {"status": "ready", "required": True, "device": getattr(asr, "device", None), "vram_mb": None}
+            components["asr"] = {"status": "ready", "required": True, "device": getattr(asr, "device", None), "vram_mb": None}
 
             if self.config.diarization_enabled:
-                self.components["diarization"] = {"status": "loading", "required": False}
+                components["diarization"] = {"status": "loading", "required": False}
                 try:
                     await asyncio.to_thread(verify_artifact, self.config.diarization_model, allow_unpinned=env_bool("PARAKEET_ALLOW_UNPINNED_MODELS"))
                     diarizer = await asyncio.to_thread(
@@ -189,95 +208,121 @@ class ModelManager:
                     )
                     if hasattr(diarizer, "warm"):
                         await diarizer.warm()
-                    self.diarizer = diarizer
-                    self.components["diarization"] = {"status": "ready", "required": False, "device": getattr(diarizer, "device", None), "vram_mb": None}
+                    components["diarization"] = {"status": "ready", "required": False, "device": getattr(diarizer, "device", None), "vram_mb": None}
                 except Exception as exc:
-                    self.components["diarization"] = {"status": "degraded", "required": False, "error": str(exc), "vram_mb": None}
+                    await self._close(diarizer); diarizer = None
+                    components["diarization"] = {"status": "degraded", "required": False, "error": str(exc), "vram_mb": None}
 
             if self.config.identity_enabled:
-                self.components["identity"] = {"status": "loading", "required": False, "device": "cpu"}
+                components["identity"] = {"status": "loading", "required": False, "device": "cpu"}
                 try:
                     # CAM++ deliberately remains resident across GPU unloads.
                     # Reuse it and restore component reporting on reload.
-                    if self.embedding is None:
-                        self.embedding = await asyncio.to_thread(
+                    if embedding is None:
+                        embedding = await asyncio.to_thread(
                             self._embedding_factory,
                             self.config.campp_model,
                             intra_threads=self.config.campp_intra_threads,
                             inter_threads=self.config.campp_inter_threads,
                             concurrency=self.config.campp_concurrency,
                         )
-                    if self.identity is None:
+                        new_embedding = True
+                    if identity is None:
                         store = SpeakerStore(self.config.speaker_store)
-                        self.identity = IdentityService(
-                            self.embedding, store,
+                        identity = IdentityService(
+                            embedding, store,
                             threshold=self.config.identity_threshold,
                             margin=self.config.identity_margin,
                             minimum_audio=self.config.identity_minimum_audio,
                         )
-                    self.components["identity"] = {"status": "ready", "required": False, "device": "cpu", "vram_mb": 0}
+                    components["identity"] = {"status": "ready", "required": False, "device": "cpu", "vram_mb": 0}
                 except Exception as exc:
-                    self.components["identity"] = {"status": "degraded", "required": False, "device": "cpu", "error": str(exc), "vram_mb": 0}
+                    if new_embedding:
+                        await self._close(embedding); embedding = None; identity = None; new_embedding = False
+                    components["identity"] = {"status": "degraded", "required": False, "device": "cpu", "error": str(exc), "vram_mb": 0}
 
+            committed = False
             async with self.lock:
-                if self.state == "loading":
+                if self.state == "loading" and self.generation == generation:
+                    self.asr, self.diarizer = asr, diarizer
+                    self.embedding, self.identity = embedding, identity
+                    self.components = components
                     self.state = "loaded"
+                    self.telemetry_at = 0.0
+                    committed = True
+            if committed:
+                self._log_device("ASR", asr)
+                if diarizer is not None:
+                    self._log_device("Diarization", diarizer)
+                return
+            await self._close(diarizer)
+            await self._close(asr)
+            if new_embedding:
+                await self._close(embedding)
         except asyncio.CancelledError:
-            if diarizer:
-                await diarizer.close()
-            if asr:
-                await asr.close()
+            await self._close(diarizer); await self._close(asr)
+            if new_embedding: await self._close(embedding)
             raise
         except Exception as exc:
-            self.components["asr"] = {"status": "error", "required": True, "error": str(exc)}
-            if diarizer:
-                await diarizer.close()
-            if asr:
-                await asr.close()
-            self.asr = self.diarizer = None
+            await self._close(diarizer); await self._close(asr)
+            if new_embedding: await self._close(embedding)
             async with self.lock:
-                if self.state == "loading":
+                if self.state == "loading" and self.generation == generation:
+                    self.components = {"asr": {"status": "error", "required": True, "error": str(exc)}}
                     self.state = "error"
 
-    async def _unload(self) -> None:
+    @staticmethod
+    def _log_device(component: str, backend) -> None:
+        detail = getattr(backend, "device_description", None)
+        if isinstance(detail, dict):
+            LOG.info("%s device: kind=%s name=%s device_id=%s", component, detail.get("kind"), detail.get("name"), detail.get("device_id"))
+        else:
+            LOG.info("%s device: device_id=%s", component, getattr(backend, "device", None))
+
+    async def _unload(self, pending_load: asyncio.Task | None = None) -> None:
+        if pending_load is not None and not pending_load.done():
+            try:
+                await asyncio.shield(pending_load)
+            except asyncio.CancelledError:
+                if not pending_load.cancelled():
+                    raise
+            except Exception:
+                pass
         await self.idle.wait()
-        diarizer, asr = self.diarizer, self.asr
-        self.diarizer = self.asr = None
-        if diarizer is not None:
-            await diarizer.close()
-        if asr is not None:
-            await asr.close()
-        follow_up = self.load_after_unload
-        self.load_after_unload = False
         async with self.lock:
-            if self.state == "unloading":
-                self.state = "unloaded"
-        if self.components:
-            self.components["asr"] = {"status": "unloaded", "required": True}
-            if "diarization" in self.components:
-                self.components["diarization"] = {"status": "unloaded", "required": False}
+            diarizer, asr = self.diarizer, self.asr
+            self.diarizer = self.asr = None
+        await self._close(diarizer); await self._close(asr)
+        async with self.lock:
+            follow_up = self.load_after_unload
+            self.load_after_unload = False
+            self.state = "unloaded"
+            self.telemetry_at = 0.0
+            if self.components:
+                self.components["asr"] = {"status": "unloaded", "required": True}
+                if "diarization" in self.components:
+                    self.components["diarization"] = {"status": "unloaded", "required": False}
         if follow_up:
             await self.request_load()
 
     async def shutdown(self) -> None:
-        if self.task and not self.task.done():
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-        if self.diarizer is not None:
-            await self.diarizer.close()
-        if self.asr is not None:
-            await self.asr.close()
-        if self.embedding is not None:
-            await self.embedding.close()
-        self.diarizer = self.asr = self.embedding = self.identity = None
+        async with self.lock:
+            self.generation += 1
+            self.load_after_unload = False
+            self.state = "unloading"
+            pending_load = self.load_task
+            if self.unload_task is None or self.unload_task.done():
+                self.unload_task = asyncio.create_task(self._unload(pending_load))
+            task = self.unload_task
+        await task
+        embedding = self.embedding
+        self.embedding = self.identity = None
+        await self._close(embedding)
         self.state = "unloaded"
 
-    async def gpu_metrics(self) -> tuple[str | None, int | None]:
+    async def gpu_metrics(self) -> dict[str, Any]:
         if self.state != "loaded":
-            return None, 0
+            return {"gpu_memory": [], "total_mb": 0}
         if time.monotonic() - self.telemetry_at < 1:
             return self.telemetry
         try:
@@ -287,26 +332,26 @@ class ModelManager:
             )
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=0.75)
             rows = [line.split(",") for line in stdout.decode().splitlines()]
-            matches = [(parts[1].strip(), int(float(parts[2]))) for parts in rows if len(parts) == 3 and parts[0].strip() == str(os.getpid())]
-            used = sum(value for _, value in matches) if matches else None
-            device = getattr(self.asr, "device", None)
-            self.telemetry = (device, used)
+            matches = [{"uuid": parts[1].strip(), "used_mb": int(float(parts[2]))} for parts in rows if len(parts) == 3 and parts[0].strip() == str(os.getpid())]
+            self.telemetry = {"gpu_memory": matches, "total_mb": sum(item["used_mb"] for item in matches) if matches else None}
         except (FileNotFoundError, TimeoutError, ValueError):
-            self.telemetry = (getattr(self.asr, "device", None), None)
+            self.telemetry = {"gpu_memory": [], "total_mb": None}
         self.telemetry_at = time.monotonic()
         return self.telemetry
 
     async def health(self) -> dict[str, Any]:
         async with self.lock:
             state = self.state
-        device, used = await self.gpu_metrics()
+        telemetry = await self.gpu_metrics(); used = telemetry["total_mb"]
         body: dict[str, Any] = {
             "status": "ready" if state == "loaded" else "unavailable",
             "model": self.model_id,
             "model_state": state,
-            "device": device,
+            "device": getattr(self.asr, "device", None),
             "vram_allocated_mb": used,
             "vram_reserved_mb": used,
+            "gpu_memory": telemetry["gpu_memory"],
+            "gpu_memory_scope": "process_total",
         }
         if self.components:
             body["components"] = self.components

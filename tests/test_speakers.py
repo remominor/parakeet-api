@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -39,6 +40,27 @@ class SpeakerStoreTests(unittest.TestCase):
             self.assertEqual(match_embedding(query, [alice], threshold=1.0, margin=None, target="alice")["status"], "known")
             self.assertEqual(match_embedding(query, [alice, bob], threshold=0.5, margin=0.25)["status"], "ambiguous")
             self.assertEqual(match_embedding(query, [alice, bob], threshold=0.5, margin=0.1)["status"], "known")
+
+    def test_single_candidate_does_not_require_margin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpeakerStore(directory)
+            alice = store.create("alice", None, [np.r_[1, np.zeros(511)]])
+            self.assertEqual(match_embedding(np.r_[1, np.zeros(511)], [alice], threshold=.5, margin=None)["status"], "known")
+            self.assertEqual(match_embedding(np.r_[0, 1, np.zeros(510)], [alice], threshold=.5, margin=None)["status"], "unknown")
+
+    def test_concurrent_create_is_atomic_no_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpeakerStore(directory); barrier = threading.Barrier(2); outcomes = []
+            def create(vector):
+                barrier.wait()
+                try: store.create("alice", None, [vector]); outcomes.append("created")
+                except FileExistsError: outcomes.append("conflict")
+            threads = [threading.Thread(target=create, args=(np.r_[1, np.zeros(511)],)), threading.Thread(target=create, args=(np.r_[0, 1, np.zeros(510)],))]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
+            self.assertCountEqual(outcomes, ["created", "conflict"])
+            self.assertEqual(store.get("alice").embedding.shape, (512,))
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
     def test_dimension_and_id_validation(self):
         with tempfile.TemporaryDirectory() as directory:

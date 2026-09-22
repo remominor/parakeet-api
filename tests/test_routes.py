@@ -1,8 +1,13 @@
+import asyncio
+import dataclasses
+import threading
 import unittest
 import tempfile
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from gateway.audio import wav_bytes
@@ -32,6 +37,31 @@ class BrokenIdentity:
         raise RuntimeError("broken")
 
 
+class BlockingDiarizer:
+    def __init__(self): self.entered = threading.Event(); self.release = threading.Event(); self.closed = False
+    async def diarize(self, _pcm):
+        self.entered.set(); await asyncio.to_thread(self.release.wait)
+        if self.closed: raise RuntimeError("closed during request")
+        return [SpeakerSegment(0, 1, "speaker_0")]
+
+
+class LeaseManager:
+    model_id = "parakeet-unified-en-0.6b"
+    identity = None
+    def __init__(self): self.asr = FakeASR(); self.diarizer = BlockingDiarizer(); self.active = 0; self.idle = threading.Event(); self.idle.set()
+    async def is_loaded(self): return True
+    @asynccontextmanager
+    async def admit(self):
+        self.active += 1; self.idle.clear()
+        try: yield
+        finally:
+            self.active -= 1
+            if not self.active: self.idle.set()
+    async def unload(self):
+        await asyncio.to_thread(self.idle.wait); self.diarizer.closed = True
+    async def shutdown(self): pass
+
+
 class FakeManager:
     model_id = "parakeet-unified-en-0.6b"
     asr = FakeASR()
@@ -48,6 +78,7 @@ class FakeManager:
 class RouteTests(unittest.TestCase):
     def setUp(self):
         import gateway.app as module
+        self.module = module
         self.patch = patch.object(module, "ModelManager", return_value=FakeManager())
         self.patch.start()
         self.client = TestClient(module.app)
@@ -63,6 +94,30 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(set(response.json()), {"text", "duration"})
         self.assertEqual(response.headers["x-parakeet-transcoded"], "0")
+
+    def test_webui_contains_complete_manual_console(self):
+        with patch.object(self.module, "SETTINGS", dataclasses.replace(self.module.SETTINGS, webui_enabled=True)):
+            response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        for marker in ("speech_context", "/v1/speakers/enroll", "/v1/speakers/verify", "Record enrollment sample", "Raw speech context", "sessionStorage"):
+            self.assertIn(marker, response.text)
+
+    def test_metrics_exposes_exact_queue_gauge(self):
+        previous = self.module.STATS.requests_queued; self.module.STATS.requests_queued = 3
+        try:
+            with patch.object(self.module, "SETTINGS", dataclasses.replace(self.module.SETTINGS, metrics_enabled=True)):
+                response = self.client.get("/metrics")
+            self.assertIn("# TYPE parakeet_requests_queued gauge", response.text)
+            self.assertIn("parakeet_requests_queued 3", response.text)
+        finally:
+            self.module.STATS.requests_queued = previous
+
+    def test_ui_api_routes_return_structured_auth_error(self):
+        with patch.object(self.module, "SETTINGS", dataclasses.replace(self.module.SETTINGS, keys=["secret"])):
+            response = self.client.get("/v1/speakers")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], 401)
+        self.assertIsInstance(response.json()["error"]["message"], str)
 
     def test_enrichment_failure_fails_open(self):
         response = self.client.post("/v1/audio/transcriptions", files={"file": ("a.wav", self.audio, "audio/wav")}, data={"speech_context": "diarization"})
@@ -95,6 +150,26 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(context["components"]["identity"], "degraded")
         self.assertEqual(context["speaker_status"]["speaker_0"]["status"], "unavailable")
 
+    def test_unexpected_fusion_failure_fails_open_without_internal_detail(self):
+        self.client.app.state.model.diarizer = FakeDiarizer()
+        with patch("gateway.app.attribute_words", side_effect=RuntimeError("private stack detail")):
+            response = self.client.post("/v1/audio/transcriptions", data={"speech_context": "diarization"}, files={"file": ("a.wav", self.audio, "audio/wav")})
+        self.assertEqual(response.status_code, 200)
+        context = response.json()["speech_context"]
+        self.assertEqual(context["status"], "degraded")
+        self.assertEqual(context["errors"][-1]["code"], "unexpected_error")
+        self.assertNotIn("private stack detail", response.text)
+
+    def test_full_enrichment_holds_admission_until_diarization_finishes(self):
+        manager = LeaseManager(); self.client.app.state.model = manager; response_box = {}
+        request_thread = threading.Thread(target=lambda: response_box.setdefault("response", self.client.post("/v1/audio/transcriptions", data={"speech_context": "full"}, files={"file": ("a.wav", self.audio, "audio/wav")})))
+        request_thread.start(); self.assertTrue(manager.diarizer.entered.wait(2))
+        unload_done = threading.Event()
+        unload_thread = threading.Thread(target=lambda: (asyncio.run(manager.unload()), unload_done.set()))
+        unload_thread.start(); self.assertFalse(unload_done.wait(.05)); self.assertFalse(manager.diarizer.closed)
+        manager.diarizer.release.set(); request_thread.join(2); unload_thread.join(2)
+        self.assertTrue(unload_done.is_set()); self.assertTrue(manager.diarizer.closed); self.assertEqual(response_box["response"].status_code, 200)
+
     def test_speaker_enrollment_privacy_duplicate_verify_and_delete(self):
         loud_audio = wav_bytes((1000).to_bytes(2, "little", signed=True) * 32000)
         with tempfile.TemporaryDirectory() as directory:
@@ -113,6 +188,21 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(verified.json()["status"], "calibration_required")
             self.assertEqual(self.client.delete("/v1/speakers/alice").status_code, 204)
             self.assertEqual(self.client.get("/v1/speakers/alice").status_code, 404)
+
+
+class QueueAccountingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admission_failure_decrements_queue_exactly_once(self):
+        import gateway.app as module
+        class RejectManager:
+            @asynccontextmanager
+            async def admit(self):
+                raise HTTPException(503, "no admission")
+                yield
+        application = SimpleNamespace(state=SimpleNamespace(model=RejectManager()))
+        before = module.STATS.requests_queued
+        with self.assertRaises(HTTPException):
+            await module.engine_transcribe(application, np.zeros(16000, dtype=np.float32))
+        self.assertEqual(module.STATS.requests_queued, before)
 
 
 if __name__ == "__main__":
