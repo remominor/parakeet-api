@@ -99,7 +99,7 @@ class RouteTests(unittest.TestCase):
         with patch.object(self.module, "SETTINGS", dataclasses.replace(self.module.SETTINGS, webui_enabled=True)):
             response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        for marker in ("speech_context", "/v1/speakers/enroll", "/v1/speakers/verify", "Record enrollment sample", "Raw speech context", "sessionStorage"):
+        for marker in ("speech_context", "/v1/speakers/enroll", "/v1/speakers/verify", "Record enrollment sample", "Raw speech context", "sessionStorage", "candidate_score", "stream?.getTracks()"):
             self.assertIn(marker, response.text)
 
     def test_metrics_exposes_exact_queue_gauge(self):
@@ -186,6 +186,9 @@ class RouteTests(unittest.TestCase):
             self.assertNotIn("embedding", listed[0])
             verified = self.client.post("/v1/speakers/verify", data={"speaker_id": "alice"}, files={"file": ("a.wav", loud_audio, "audio/wav")})
             self.assertEqual(verified.json()["status"], "calibration_required")
+            self.assertEqual(verified.json()["speaker_id"], "alice")
+            self.assertEqual(verified.json()["display_name"], "Alice")
+            self.assertAlmostEqual(verified.json()["score"], 1.0)
             self.assertEqual(self.client.delete("/v1/speakers/alice").status_code, 204)
             self.assertEqual(self.client.get("/v1/speakers/alice").status_code, 404)
 

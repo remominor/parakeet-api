@@ -226,15 +226,17 @@ def match_embedding(
     compatible = [item for item in records if item.compatibility == "compatible" and item.embedding is not None]
     if target is not None:
         compatible = [item for item in compatible if item.speaker_id == target]
-    if threshold is None:
-        return {"status": "calibration_required"}
     if not compatible:
-        return {"status": "unknown", "score": None}
-    if target is None and len(compatible) > 1 and margin is None:
-        return {"status": "calibration_required"}
+        return {"status": "calibration_required"} if threshold is None else {"status": "unknown", "score": None}
     query = l2_normalize(embedding)
     ranked = sorted(((float(np.dot(query, item.embedding)), item) for item in compatible), reverse=True, key=lambda value: value[0])
     top_score, top = ranked[0]
+    if threshold is None:
+        if target is not None:
+            return {"status": "calibration_required", "speaker_id": top.speaker_id, "display_name": top.display_name, "score": round(top_score, 6)}
+        return {"status": "calibration_required", "candidate_speaker_id": top.speaker_id, "candidate_display_name": top.display_name, "candidate_score": round(top_score, 6)}
+    if target is None and len(compatible) > 1 and margin is None:
+        return {"status": "calibration_required", "candidate_speaker_id": top.speaker_id, "candidate_display_name": top.display_name, "candidate_score": round(top_score, 6)}
     if top_score < threshold:
         return {"status": "unknown", "score": round(top_score, 6)}
     if target is None and len(ranked) > 1 and top_score - ranked[1][0] < float(margin):

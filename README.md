@@ -106,8 +106,14 @@ remain available, but matching returns `calibration_required`; full-context
 transcription still returns diarization. A threshold is always required. With
 one compatible enrolled speaker, that threshold alone permits known/unknown
 matching. With multiple candidates, all-speaker matching also requires the
-ambiguity margin. Targeted verification only requires the threshold. Calibrate
-from a labeled JSONL file:
+ambiguity margin. Targeted verification only requires the threshold.
+
+Before calibration, verification remains non-decisive but returns similarity
+data for testing: targeted verification includes `speaker_id`, `display_name`,
+and `score`; all-speaker matching includes the top `candidate_speaker_id`,
+`candidate_display_name`, and `candidate_score`.
+
+Calibrate from a labeled JSONL file:
 
 ```json
 {"speaker_id":"alice","audio":"fixtures/alice-1.wav"}

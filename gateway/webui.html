@@ -41,11 +41,12 @@ $('file').onchange=e=>loadTranscriptionFile(e.target.files[0]);$('drop').ondrago
 
 async function toggleRecorder(button,onFile,prefix){
   if(activeRecording){if(activeRecording.button!==button){show($('server'),'Stop the active recording first.','error');return}activeRecording.recorder.stop();return}
-  try{let stream=await navigator.mediaDevices.getUserMedia({audio:true}),chunks=[],recorder=new MediaRecorder(stream);activeRecording={button,recorder,stream};button.textContent='Stop recording';
+  let stream;
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:true});let chunks=[],recorder=new MediaRecorder(stream);activeRecording={button,recorder,stream};button.textContent='Stop recording';
     recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
     recorder.onstop=()=>{let type=recorder.mimeType||'audio/webm',name=`${prefix}-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;stream.getTracks().forEach(track=>track.stop());activeRecording=null;button.textContent=button.dataset.label;onFile(new File(chunks,name,{type}))};
     recorder.onerror=()=>{stream.getTracks().forEach(track=>track.stop());activeRecording=null;button.textContent=button.dataset.label};recorder.start();
-  }catch(error){show($('server'),error.message,'error')}
+  }catch(error){stream?.getTracks().forEach(track=>track.stop());activeRecording=null;button.textContent=button.dataset.label;show($('server'),error.message,'error')}
 }
 for(let id of ['record','enrollRecord','verifyRecord'])$(id).dataset.label=$(id).textContent;
 $('record').onclick=()=>toggleRecorder($('record'),loadTranscriptionFile,'transcription');
@@ -77,7 +78,7 @@ async function loadSpeakers(){let root=$('speakers'),select=$('verifySpeaker');t
 async function deleteSpeaker(speaker){if(!confirm(`Delete speaker "${speaker.display_name||speaker.speaker_id}" (${speaker.speaker_id})?`))return;try{await api(`/v1/speakers/${encodeURIComponent(speaker.speaker_id)}`,{method:'DELETE'});await loadSpeakers()}catch(error){show($('verifyStatus'),error.message,'error')}}
 function setVerifyFile(selected){if(!selected)return;verifyFile=selected;$('verifyAudio').src=objectUrl(selected);$('verify').disabled=false;show($('verifyStatus'),selected.name)}
 $('verifyFile').onchange=e=>setVerifyFile(e.target.files[0]);$('verifyRecord').onclick=()=>toggleRecorder($('verifyRecord'),setVerifyFile,'verification');
-$('verify').onclick=async()=>{if(!verifyFile)return;let form=new FormData;form.append('file',verifyFile,verifyFile.name);if($('verifySpeaker').value)form.append('speaker_id',$('verifySpeaker').value);show($('verifyStatus'),'Verifying…');try{let response=await api('/v1/speakers/verify',{method:'POST',body:form}),body=await response.json();show($('verifyStatus'),`Status: ${body.status}${body.display_name?` · ${body.display_name}`:''}${body.speaker_id?` · ${body.speaker_id}`:''}${body.score!=null?` · Score: ${Number(body.score).toFixed(3)}`:''}`,body.status==='known'?'success':'')}catch(error){show($('verifyStatus'),error.message,'error')}};
+$('verify').onclick=async()=>{if(!verifyFile)return;let form=new FormData;form.append('file',verifyFile,verifyFile.name);if($('verifySpeaker').value)form.append('speaker_id',$('verifySpeaker').value);show($('verifyStatus'),'Verifying…');try{let response=await api('/v1/speakers/verify',{method:'POST',body:form}),body=await response.json(),name=body.display_name||body.candidate_display_name,id=body.speaker_id||body.candidate_speaker_id,score=body.score??body.candidate_score;show($('verifyStatus'),`Status: ${body.status}${name?` · ${name}`:''}${id?` · ${id}`:''}${score!=null?` · Score: ${Number(score).toFixed(3)}`:''}`,body.status==='known'?'success':'')}catch(error){show($('verifyStatus'),error.message,'error')}};
 
 async function loadCapabilities(){try{let response=await api('/info'),body=await response.json();capabilities=body.capabilities||{};show($('server'),`${body.model} · ${body.engine}`);let options=$('context').options;options[1].disabled=!capabilities.diarization;options[2].disabled=!capabilities.diarization||!capabilities.speaker_identification;if(options[$('context').selectedIndex].disabled)$('context').value='none';$('identityDisabled').classList.toggle('hidden',!!capabilities.speaker_enrollment);$('identityControls').classList.toggle('hidden',!capabilities.speaker_enrollment);if(capabilities.speaker_enrollment)await loadSpeakers()}catch(error){show($('server'),error.status===401?'Enter a valid API key, then refresh.':error.message,'error')}}
 $('refresh').onclick=loadCapabilities;loadCapabilities();renderSamples();
